@@ -1,0 +1,6 @@
+fyers-apiv3
+pyotp
+requests
+pytz
+schedule
+python-dotenv
