@@ -702,6 +702,13 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, time as dt_time, timedelta
 import dotenv
+import asyncio
+import threading
+from fastapi import FastAPI
+import uvicorn
+
+
+app = FastAPI(title="EMA Monitor Service")
 
 dotenv.load_dotenv()
 
@@ -1557,7 +1564,7 @@ class EMAMonitor:
         print("\n👋 Goodbye! Service stopped.\n")
 
 
-def main():
+async def run_ema_monitor():
     """Main entry point."""
     # Configuration from environment variables
     CLIENT_ID = os.getenv("CLIENT_ID")
@@ -1642,7 +1649,27 @@ def main():
         import traceback
         traceback.print_exc()
 
+# FastAPI endpoint to satisfy Render's web service requirement
+@app.get("/")
+async def root():
+    return {"message": "EMA Monitor is running"}
 
+# Function to start the EMA monitor in a separate thread
+def start_ema_monitor_in_background():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_ema_monitor())
+
+# Start the EMA monitor when the FastAPI server starts
+@app.on_event("startup")
+async def startup_event():
+    print("Starting EMA Monitor in background...")
+    # Run the EMA monitor in a separate thread to avoid blocking the FastAPI event loop
+    thread = threading.Thread(target=start_ema_monitor_in_background, daemon=True)
+    thread.start()
+
+# Main entry point for running locally (not used on Render)
 if __name__ == "__main__":
-    main()
+    # For local testing, run both FastAPI and EMA monitor
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
