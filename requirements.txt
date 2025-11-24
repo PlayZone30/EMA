@@ -4,6 +4,4 @@ requests
 pytz
 schedule
 python-dotenv
-fastapi
-uvicorn
 setuptools
