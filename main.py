@@ -4,16 +4,15 @@ import pyotp
 import requests
 import json
 import hashlib
-import smtplib
 import os
 import pytz
 import time
 from urllib.parse import urlparse, parse_qs
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, time as dt_time, timedelta
 import dotenv
 import logging
+from twilio.rest import Client as TwilioClient
+from divergence_strategy import DivergenceStrategy
 
 # Configure logging
 logging.basicConfig(
@@ -244,61 +243,68 @@ class FyersAuthenticator:
         return access_token, None
 
 
-class EmailNotifier:
-    """Handles email notifications for EMA alerts."""
+class WhatsAppNotifier:
+    """Handles WhatsApp notifications for EMA alerts using Twilio."""
     
-    def __init__(self, sender_email, sender_password, recipient_email):
-        self.sender_email = sender_email
-        self.sender_password = sender_password
-        self.recipient_email = recipient_email
+    def __init__(self, account_sid, auth_token, from_number, to_number):
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+        self.from_number = from_number  # e.g., "whatsapp:+14155238886"
+        self.to_number = to_number      # e.g., "whatsapp:+917989356894"
         self.last_alert_times = {}
         self.alert_cooldown = 300  # 5 minutes
-        self.logger = logging.getLogger(f"{__name__}.EmailNotifier")
+        self.logger = logging.getLogger(f"{__name__}.WhatsAppNotifier")
+        
+        # Initialize Twilio client
+        try:
+            self.client = TwilioClient(account_sid, auth_token)
+            self.logger.info("Twilio WhatsApp client initialized successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Twilio client: {e}")
+            self.client = None
     
     def send_alert(self, symbol, symbol_name, ltp, ema_value, ema_period, timestamp):
-        """Send email alert when LTP touches EMA."""
+        """Send WhatsApp alert when LTP touches EMA."""
         if symbol in self.last_alert_times:
             elapsed = (datetime.now() - self.last_alert_times[symbol]).total_seconds()
             if elapsed < self.alert_cooldown:
                 self.logger.info(f"[{symbol_name}] Alert cooldown active. Next alert in {self.alert_cooldown - elapsed:.0f} seconds")
                 return False
         
+        if not self.client:
+            self.logger.error("Twilio client not initialized. Cannot send WhatsApp message.")
+            return False
+        
         try:
-            msg = MIMEMultipart()
-            msg['From'] = self.sender_email
-            msg['To'] = self.recipient_email
-            msg['Subject'] = f"🔔 {symbol_name} Alert: LTP Touched {ema_period} EMA"
-            
             diff_amount = ltp - ema_value
             diff_percent = (diff_amount / ema_value) * 100
             
-            body = f"""
-            <html><body>
-                <h2 style="color: #764ba2;">🔔 {symbol_name} EMA Alert</h2>
-                <p><strong>Time:</strong> {timestamp}</p>
-                <p><strong>Symbol:</strong> {symbol}</p>
-                <hr>
-                <p><strong>Last Traded Price:</strong> ₹{ltp:.2f}</p>
-                <p><strong>{ema_period} EMA (5-min):</strong> ₹{ema_value:.2f}</p>
-                <p><strong>Difference:</strong> ₹{abs(diff_amount):.2f} ({abs(diff_percent):.2f}%)</p>
-                <hr>
-                <p>✓ LTP has touched the {ema_period} EMA threshold</p>
-            </body></html>
-            """
-            msg.attach(MIMEText(body, 'html'))
+            # Format message for WhatsApp
+            message_body = (
+                f"🔔 *{symbol_name} EMA Alert*\n"
+                f"━━━━━━━━━━━━━━━━━\n"
+                f"📅 *Time:* {timestamp}\n"
+                f"📊 *Symbol:* {symbol}\n\n"
+                f"💰 *LTP:* ₹{ltp:.2f}\n"
+                f"📈 *{ema_period} EMA:* ₹{ema_value:.2f}\n"
+                f"📉 *Difference:* ₹{abs(diff_amount):.2f} ({abs(diff_percent):.2f}%)\n\n"
+                f"✅ LTP has touched the {ema_period} EMA threshold!"
+            )
             
-            self.logger.info(f"[{symbol_name}] Sending email alert...")
-            with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
-                server.starttls()
-                server.login(self.sender_email, self.sender_password)
-                server.send_message(msg)
+            self.logger.info(f"[{symbol_name}] Sending WhatsApp alert...")
             
-            self.logger.info(f"[{symbol_name}] Email alert sent successfully")
+            message = self.client.messages.create(
+                body=message_body,
+                from_=self.from_number,
+                to=self.to_number
+            )
+            
+            self.logger.info(f"[{symbol_name}] WhatsApp alert sent successfully. SID: {message.sid}")
             self.last_alert_times[symbol] = datetime.now()
             return True
             
         except Exception as e:
-            self.logger.error(f"[{symbol_name}] Error sending email: {e}")
+            self.logger.error(f"[{symbol_name}] Error sending WhatsApp message: {e}")
             return False
 
 
@@ -416,6 +422,10 @@ class CandleManager:
         if self.first_complete_candle_times.get(symbol) is not None:
             return False
         
+        if symbol not in self.symbols_config:
+            # For non-config symbols (Options), we don't skip. Start tracking immediately.
+            return False
+            
         config = self.symbols_config[symbol]
         try:
             ema_calc_hour, ema_calc_minute = map(int, config['EMA_CALCULATED_UNTIL'].split(":"))
@@ -470,6 +480,8 @@ class CandleManager:
             
             if current_candle is not None and not current_candle.get('skip', False):
                 completed_candle = current_candle.copy()
+                # Rename bucket_time to time for strategy compatibility
+                completed_candle['time'] = completed_candle.pop('bucket_time')
             
             # Start new candle
             self.current_candles[symbol] = {
@@ -595,7 +607,7 @@ class MarketScheduler:
 class EMAMonitor:
     """Main class that coordinates all components for EMA monitoring."""
     
-    def __init__(self, access_token, client_id, symbols_config, email_config):
+    def __init__(self, access_token, client_id, symbols_config, whatsapp_config):
         self.access_token = access_token
         self.client_id = client_id
         self.symbols_config = symbols_config
@@ -603,10 +615,18 @@ class EMAMonitor:
         self.logger = logging.getLogger(f"{__name__}.EMAMonitor")
         
         # Initialize components
-        self.email_notifier = EmailNotifier(**email_config)
+        self.whatsapp_notifier = WhatsAppNotifier(**whatsapp_config)
         self.ema_calculator = EMACalculator(symbols_config)
         self.candle_manager = CandleManager(symbols_config, self.timezone)
         self.market_scheduler = MarketScheduler(self.timezone)
+        
+        # Initialize Fyers Model for API calls (needed for Option Chain)
+        self.fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, log_path="")
+        
+        # Initialize Divergence Strategy
+        self.divergence_strategy = DivergenceStrategy(self.fyers)
+        self.divergence_strategy.load_capital_state()  # Load saved capital
+        self.option_symbols = set() # Track currently subscribed option symbols
         
         # Live data tracking
         self.live_symbol_data = {}
@@ -634,7 +654,8 @@ class EMAMonitor:
             symbol = message["symbol"]
             ltp = message["ltp"]
             
-            if symbol not in self.symbols_config:
+            # Skip unknown symbols (not in config and not in options)
+            if symbol not in self.symbols_config and symbol not in self.option_symbols:
                 return
             
             # Check if market is still open
@@ -644,49 +665,119 @@ class EMAMonitor:
                 return
             
             timestamp = datetime.now(self.timezone).strftime("%Y-%m-%d %H:%M:%S")
+            current_dt = datetime.now(self.timezone)
+            
+            # --- DIVERGENCE STRATEGY INTEGRATION ---
+            # Pass tick to strategy for trade management (SL/Target)
+            self.divergence_strategy.update_ltp(symbol, ltp, current_dt)
+            
+            # Check for strike rotation on NIFTY spot ticks only (throttled in strategy)
+            if symbol == "NSE:NIFTY50-INDEX":
+                ce_sym = self.divergence_strategy.current_ce_symbol
+                pe_sym = self.divergence_strategy.current_pe_symbol
+                
+                # Check for strike rotation (throttled to every 30 seconds inside strategy)
+                new_ce, new_pe = self.divergence_strategy.check_strike_rotation(ltp)
+                
+                if new_ce and new_pe:
+                    # Rotation happened - unsubscribe old, subscribe new
+                    old_symbols = [s for s in [ce_sym, pe_sym] if s]
+                    if old_symbols:
+                        self.fyers_ws.unsubscribe(symbols=old_symbols)
+                        for s in old_symbols:
+                            self.option_symbols.discard(s)
+                            if s in self.live_symbol_data:
+                                del self.live_symbol_data[s]
+                    
+                    # Subscribe new
+                    new_symbols = [new_ce, new_pe]
+                    self.fyers_ws.subscribe(symbols=new_symbols, data_type="SymbolUpdate")
+                    for s in new_symbols:
+                        self.option_symbols.add(s)
+            
+            # Pass candle data to strategy if it's a completed candle
+            # We need to track candles for Options too.
+            # CandleManager currently only tracks symbols in symbols_config.
+            # We need to extend CandleManager or handle Option candles separately.
+            # For simplicity, let's add dynamic symbols to CandleManager?
+            # Or just handle option candles here locally since CandleManager is coupled with Config.
+            
+            # Let's use a simple local candle tracker for options or add to CandleManager dynamically.
+            # Adding to CandleManager is cleaner but requires modifying it to handle symbols without config.
+            # Let's modify CandleManager.update_candle to handle unknown symbols gracefully (defaulting to 5 min).
+            
+            # For now, let's assume CandleManager can handle it if we don't crash on missing config.
+            # We need to modify CandleManager.should_skip_candle to handle missing config.
             
             # Update candle and check for completion
             completed_candle = self.candle_manager.update_candle(symbol, ltp)
             
             if completed_candle:
-                config = self.symbols_config[symbol]
-                close_price = completed_candle['close']
-                previous_ema, new_ema = self.ema_calculator.update_ema(symbol, close_price)
+                # Pass to Divergence Strategy
+                self.divergence_strategy.process_candle(symbol, completed_candle)
                 
-                self.logger.info("="*60)
-                self.logger.info(f"[{config['name']}] 5-MIN CANDLE COMPLETED")
-                self.logger.info(f"  Time: {completed_candle['bucket_time'].strftime('%Y-%m-%d %H:%M')}")
-                self.logger.info(f"  Close: ₹{close_price:.2f}")
-                self.logger.info(f"  Previous EMA: ₹{previous_ema:.2f} | New EMA: ₹{new_ema:.2f}")
-                self.logger.info("="*60)
+                # Existing EMA Logic (Only for configured symbols)
+                if symbol in self.symbols_config:
+                    config = self.symbols_config[symbol]
+                    close_price = completed_candle['close']
+                    previous_ema, new_ema = self.ema_calculator.update_ema(symbol, close_price)
+                    
+                    print()  # New line before candle log
+                    self.logger.info("="*60)
+                    self.logger.info(f"[{config['name']}] 5-MIN CANDLE COMPLETED")
+                    self.logger.info(f"  Time: {completed_candle['time'].strftime('%Y-%m-%d %H:%M')}")
+                    self.logger.info(f"  Close: ₹{close_price:.2f}")
+                    self.logger.info(f"  Previous EMA: ₹{previous_ema:.2f} | New EMA: ₹{new_ema:.2f}")
+                    self.logger.info("="*60)
             
             # Update live data
-            ema_value = self.ema_calculator.get_ema(symbol)
-            if ema_value is not None:
-                self.live_symbol_data[symbol] = {'ltp': ltp, 'ema': ema_value}
+            ema_value = self.ema_calculator.get_ema(symbol) # Returns None for options
+            self.live_symbol_data[symbol] = {'ltp': ltp, 'ema': ema_value}
                 
-                # Build status line for all symbols
-                status_parts = []
-                for s, config in self.symbols_config.items():
-                    data = self.live_symbol_data.get(s)
-                    if data:
-                        status_parts.append(f"{config['name']} LTP: ₹{data['ltp']:.2f} (EMA: ₹{data['ema']:.2f})")
-                    else:
-                        status_parts.append(f"{config['name']} LTP: Waiting...")
-                
-                # Log at DEBUG level to reduce noise (console will still show INFO level)
-                self.logger.debug(f"[{timestamp}] {' | '.join(status_parts)}")
-                
-                # Check for EMA touch
-                if self.check_ema_touch(symbol, ltp, ema_value):
-                    config = self.symbols_config[symbol]
-                    self.logger.warning("="*60)
-                    self.logger.warning(f"🔔 ALERT: [{config['name']}] LTP (₹{ltp:.2f}) TOUCHED EMA (₹{ema_value:.2f})")
-                    self.logger.warning("="*60)
-                    self.email_notifier.send_alert(
-                        symbol, config['name'], ltp, ema_value,
-                        config['EMA_PERIOD'], timestamp
-                    )
+            # Build status line for spot symbols
+            status_parts = []
+            for s, config in self.symbols_config.items():
+                data = self.live_symbol_data.get(s)
+                if data:
+                    status_parts.append(f"{config['name']}: ₹{data['ltp']:.2f} (EMA: ₹{data['ema']:.2f})")
+                else:
+                    status_parts.append(f"{config['name']}: Waiting...")
+            
+            # Add option prices to status line
+            ce_sym = self.divergence_strategy.current_ce_symbol
+            pe_sym = self.divergence_strategy.current_pe_symbol
+            if ce_sym:
+                ce_data = self.live_symbol_data.get(ce_sym)
+                ce_strike = ce_sym.split('NIFTY')[1][:7] if 'NIFTY' in ce_sym else ce_sym[-10:]
+                if ce_data:
+                    status_parts.append(f"CE({ce_strike}): ₹{ce_data['ltp']:.2f}")
+                else:
+                    status_parts.append(f"CE({ce_strike}): Waiting...")
+            if pe_sym:
+                pe_data = self.live_symbol_data.get(pe_sym)
+                pe_strike = pe_sym.split('NIFTY')[1][:7] if 'NIFTY' in pe_sym else pe_sym[-10:]
+                if pe_data:
+                    status_parts.append(f"PE({pe_strike}): ₹{pe_data['ltp']:.2f}")
+                else:
+                    status_parts.append(f"PE({pe_strike}): Waiting...")
+            
+            # Print tick data on single updating line (no newline, carriage return overwrites)
+            # Add padding to ensure line is fully cleared when content is shorter
+            status_line = f"[{timestamp}] {' | '.join(status_parts)}"
+            # Pad to 150 chars to clear previous content, then carriage return
+            print(f"\r{status_line:<150}", end='', flush=True)
+            
+            # Check for EMA touch
+            if symbol in self.symbols_config and self.check_ema_touch(symbol, ltp, ema_value):
+                config = self.symbols_config[symbol]
+                print()  # New line before alert
+                self.logger.warning("="*60)
+                self.logger.warning(f"🔔 ALERT: [{config['name']}] LTP (₹{ltp:.2f}) TOUCHED EMA (₹{ema_value:.2f})")
+                self.logger.warning("="*60)
+                self.whatsapp_notifier.send_alert(
+                    symbol, config['name'], ltp, ema_value,
+                    config['EMA_PERIOD'], timestamp
+                )
             
             # Check for market close time
             now = datetime.now(self.timezone)
@@ -695,6 +786,9 @@ class EMAMonitor:
             if now >= market_close and not self.ema_calculator.end_of_day_saved:
                 self.logger.info(f"Market closed at {market_close.strftime('%H:%M')}. Saving EMAs...")
                 self.ema_calculator.save_emas()
+                # Generate divergence strategy daily report
+                self.divergence_strategy.generate_daily_report()
+                self.divergence_strategy.save_capital_state()
                 self.stop_websocket()
         
         except Exception as e:
@@ -726,7 +820,25 @@ class EMAMonitor:
         self.logger.info("="*60)
         self.logger.info("Live monitoring started...")
         
+        # Subscribe to EMA symbols
         self.fyers_ws.subscribe(symbols=symbols_to_subscribe, data_type="SymbolUpdate")
+        
+        # --- DIVERGENCE STRATEGY STARTUP ---
+        self.logger.info("Initializing Divergence Strategy Options...")
+        # Get initial strikes
+        ce, pe = self.divergence_strategy.get_best_strikes(None)
+        if ce and pe:
+            self.logger.info(f"Initial Options Selected: CE={ce}, PE={pe}")
+            self.divergence_strategy.current_ce_symbol = ce
+            self.divergence_strategy.current_pe_symbol = pe
+            
+            option_symbols = [ce, pe]
+            self.fyers_ws.subscribe(symbols=option_symbols, data_type="SymbolUpdate")
+            for s in option_symbols:
+                self.option_symbols.add(s)
+        else:
+            self.logger.warning("Failed to select initial options for Divergence Strategy")
+            
         self.is_websocket_active = True
         self.fyers_ws.keep_running()
     
@@ -810,6 +922,7 @@ class EMAMonitor:
         
         self.ema_calculator.reset_end_of_day_flag()
         self.candle_manager.reset_for_new_day()
+        self.divergence_strategy.reset_for_new_day()  # Reset divergence strategy
         
         # Start monitoring
         self.logger.info("Starting market monitoring...")
@@ -827,6 +940,9 @@ class EMAMonitor:
                 self.logger.info(f"Market closed at {market_close.strftime('%H:%M')}.")
                 if not self.ema_calculator.end_of_day_saved:
                     self.ema_calculator.save_emas()
+                    # Generate divergence strategy daily report
+                    self.divergence_strategy.generate_daily_report()
+                    self.divergence_strategy.save_capital_state()
                 self.stop_websocket()
                 break
         
@@ -924,11 +1040,12 @@ def main():
     }
     
 
-    # Email configuration - use environment variables
-    EMAIL_CONFIG = {
-        "sender_email": os.getenv("SENDER_EMAIL",'pavansaireddy30@gmail.com'),
-        "sender_password": os.getenv("SENDER_PASSWORD",'ollm utld cwxo dqtu'),
-        "recipient_email": os.getenv("RECIPIENT_EMAIL",'pavansaireddy30@gmail.com')
+    # WhatsApp configuration - Twilio
+    WHATSAPP_CONFIG = {
+        "account_sid": os.getenv("TWILIO_ACCOUNT_SID"),
+        "auth_token": os.getenv("TWILIO_AUTH_TOKEN"),
+        "from_number": os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886"),
+        "to_number": os.getenv("WHATSAPP_TO", "whatsapp:+917989356894")
     }
     
     # Validate configuration
@@ -937,9 +1054,9 @@ def main():
         logger.error("Please set: CLIENT_ID, SECRET_KEY, USERNAME, PIN, TOTP_KEY")
         return
     
-    if not all([EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'], EMAIL_CONFIG['recipient_email']]):
-        logger.error("Missing email configuration!")
-        logger.error("Please set: SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL")
+    if not all([WHATSAPP_CONFIG['account_sid'], WHATSAPP_CONFIG['auth_token']]):
+        logger.error("Missing Twilio WhatsApp configuration!")
+        logger.error("Please set: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN")
         return
     
     logger.info("="*70)
@@ -973,7 +1090,7 @@ def main():
             access_token=access_token,
             client_id=CLIENT_ID,
             symbols_config=SYMBOLS_CONFIG,
-            email_config=EMAIL_CONFIG
+            whatsapp_config=WHATSAPP_CONFIG
         )
         
         # Run the 24/7 monitoring service
