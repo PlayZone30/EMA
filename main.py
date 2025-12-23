@@ -569,6 +569,8 @@ class MarketScheduler:
     def seconds_until_market_open(self):
         """Calculate seconds until next market open."""
         now = datetime.now(self.timezone)
+        current_date = now.date()
+        current_time = now.time()
         
         # If market is currently open, return 0
         if self.is_market_open():
@@ -576,6 +578,16 @@ class MarketScheduler:
         
         # Find the next market open time
         days_ahead = 0
+        
+        # If today is a trading day but market hasn't opened yet, use today
+        # If today is a trading day but market already closed, start from tomorrow
+        if not self.is_market_holiday(current_date) and current_time < self.market_open_time:
+            # Market hasn't opened today yet
+            days_ahead = 0
+        else:
+            # Market already closed today or today is holiday - start from tomorrow
+            days_ahead = 1
+        
         while days_ahead < 7:
             check_date = (now + timedelta(days=days_ahead)).date()
             
@@ -635,6 +647,7 @@ class EMAMonitor:
         self.fyers_ws = None
         self.is_websocket_active = False
         self.should_stop = False
+        self.daily_cycle_completed = False  # Track if today's cycle is done
     
     def check_ema_touch(self, symbol, ltp, ema_value):
         """Check if LTP has touched the EMA."""
@@ -848,6 +861,17 @@ class EMAMonitor:
             self.logger.warning("WebSocket is already active")
             return
         
+        # Don't start if market is closed or past close time
+        now = datetime.now(self.timezone)
+        market_close = self.market_scheduler.get_market_close_time_today()
+        if now >= market_close:
+            self.logger.warning(f"Cannot start WebSocket - market already closed at {market_close.strftime('%H:%M')}")
+            return
+        
+        if not self.market_scheduler.is_market_open():
+            self.logger.warning("Cannot start WebSocket - market is not open")
+            return
+        
         try:
             self.logger.info("Initializing WebSocket connection...")
             self.fyers_ws = data_ws.FyersDataSocket(
@@ -884,12 +908,27 @@ class EMAMonitor:
     
     def run_daily_cycle(self):
         """Run one complete daily cycle of monitoring."""
+        # Check if cycle already completed for today
+        now = datetime.now(self.timezone)
+        market_close = self.market_scheduler.get_market_close_time_today()
+        
+        if self.daily_cycle_completed and now < market_close + timedelta(hours=12):
+            # Cycle already completed and we're still on the same day
+            # Don't run again until next trading day
+            return
+        
         # Check if today is a trading day
         if self.market_scheduler.is_market_holiday():
-            now = datetime.now(self.timezone)
             self.logger.info(f"{now.strftime('%A, %B %d, %Y')}")
             self.logger.info("Market is closed today (Weekend/Holiday)")
             self.logger.info("Waiting for next trading day...")
+            return
+        
+        # If it's past market close time, don't start a new cycle
+        if now >= market_close:
+            if not self.daily_cycle_completed:
+                self.logger.info(f"Market already closed at {market_close.strftime('%H:%M')}. Waiting for next trading day.")
+                self.daily_cycle_completed = True
             return
         
         # Wait until market opens
@@ -914,6 +953,9 @@ class EMAMonitor:
         
         if self.should_stop:
             return
+        
+        # Reset daily cycle flag for new trading day
+        self.daily_cycle_completed = False
         
         # Reset for new trading day
         self.logger.info("="*60)
@@ -944,12 +986,15 @@ class EMAMonitor:
                     self.divergence_strategy.generate_daily_report()
                     self.divergence_strategy.save_capital_state()
                 self.stop_websocket()
+                self.daily_cycle_completed = True
                 break
         
         # Ensure WebSocket is stopped
         if self.is_websocket_active:
             self.stop_websocket()
         
+        # Mark cycle as completed
+        self.daily_cycle_completed = True
         self.logger.info("Daily cycle completed.")
     
     def run(self):
