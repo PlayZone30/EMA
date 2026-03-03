@@ -22,8 +22,9 @@ class DivergenceStrategy:
     - Capital: Fixed ₹10,000 per trade (Paper Trading).
     """
     
-    def __init__(self, fyers, log_file="divergence_trades.csv"):
+    def __init__(self, fyers, email_notifier=None, log_file="divergence_trades.csv"):
         self.fyers = fyers
+        self.email_notifier = email_notifier
         self.log_file = log_file
         self.logger = logging.getLogger(f"{__name__}.DivergenceStrategy")
         
@@ -136,6 +137,17 @@ class DivergenceStrategy:
                         'time': timestamp,
                         'reason': reason
                     }
+                    
+                    # Send email alert immediately when signal is detected
+                    if self.email_notifier:
+                        self.email_notifier.send_divergence_alert(
+                            symbol=self.current_pe_symbol,
+                            signal_type="PE",
+                            spot_candle=spot_candle,
+                            option_candle=pe_candle,
+                            timestamp=timestamp,
+                            reason=reason
+                        )
 
         # Check CE Signal
         if self.current_ce_symbol:
@@ -158,6 +170,17 @@ class DivergenceStrategy:
                         'time': timestamp,
                         'reason': reason
                     }
+                    
+                    # Send email alert immediately when signal is detected
+                    if self.email_notifier:
+                        self.email_notifier.send_divergence_alert(
+                            symbol=self.current_ce_symbol,
+                            signal_type="CE",
+                            spot_candle=spot_candle,
+                            option_candle=ce_candle,
+                            timestamp=timestamp,
+                            reason=reason
+                        )
 
     def _get_candle(self, symbol, timestamp):
         """Retrieve candle for a specific timestamp."""

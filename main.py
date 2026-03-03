@@ -11,7 +11,9 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime, time as dt_time, timedelta
 import dotenv
 import logging
-from twilio.rest import Client as TwilioClient
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from divergence_strategy import DivergenceStrategy
 
 # Configure logging
@@ -243,68 +245,243 @@ class FyersAuthenticator:
         return access_token, None
 
 
-class WhatsAppNotifier:
-    """Handles WhatsApp notifications for EMA alerts using Twilio."""
+class EmailNotifier:
+    """Handles email notifications for EMA and Divergence alerts using Gmail SMTP."""
     
-    def __init__(self, account_sid, auth_token, from_number, to_number):
-        self.account_sid = account_sid
-        self.auth_token = auth_token
-        self.from_number = from_number  # e.g., "whatsapp:+14155238886"
-        self.to_number = to_number      # e.g., "whatsapp:+917989356894"
+    def __init__(self, gmail_user, gmail_app_password, to_email):
+        self.gmail_user = gmail_user
+        self.gmail_app_password = gmail_app_password
+        self.to_email = to_email
+        self.smtp_server = "smtp.gmail.com"
+        self.smtp_port = 587
         self.last_alert_times = {}
         self.alert_cooldown = 300  # 5 minutes
-        self.logger = logging.getLogger(f"{__name__}.WhatsAppNotifier")
+        self.logger = logging.getLogger(f"{__name__}.EmailNotifier")
         
-        # Initialize Twilio client
+        # Test connection
         try:
-            self.client = TwilioClient(account_sid, auth_token)
-            self.logger.info("Twilio WhatsApp client initialized successfully")
+            self._test_connection()
+            self.logger.info("Gmail SMTP connection test successful")
         except Exception as e:
-            self.logger.error(f"Failed to initialize Twilio client: {e}")
-            self.client = None
+            self.logger.error(f"Failed to connect to Gmail SMTP: {e}")
     
-    def send_alert(self, symbol, symbol_name, ltp, ema_value, ema_period, timestamp):
-        """Send WhatsApp alert when LTP touches EMA."""
-        if symbol in self.last_alert_times:
-            elapsed = (datetime.now() - self.last_alert_times[symbol]).total_seconds()
-            if elapsed < self.alert_cooldown:
-                self.logger.info(f"[{symbol_name}] Alert cooldown active. Next alert in {self.alert_cooldown - elapsed:.0f} seconds")
-                return False
-        
-        if not self.client:
-            self.logger.error("Twilio client not initialized. Cannot send WhatsApp message.")
+    def _test_connection(self):
+        """Test SMTP connection."""
+        server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+        server.starttls()
+        server.login(self.gmail_user, self.gmail_app_password)
+        server.quit()
+    
+    def _send_email(self, subject, body_html):
+        """Send email via Gmail SMTP."""
+        try:
+            msg = MIMEMultipart('alternative')
+            msg['From'] = self.gmail_user
+            msg['To'] = self.to_email
+            msg['Subject'] = subject
+            
+            # Attach HTML body
+            html_part = MIMEText(body_html, 'html')
+            msg.attach(html_part)
+            
+            # Connect and send
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            server.starttls()
+            server.login(self.gmail_user, self.gmail_app_password)
+            server.send_message(msg)
+            server.quit()
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Error sending email: {e}")
             return False
+    
+    def send_ema_alert(self, symbol, symbol_name, ltp, ema_value, ema_period, timestamp):
+        """Send email alert when LTP touches EMA."""
+        alert_key = f"ema_{symbol}"
+        if alert_key in self.last_alert_times:
+            elapsed = (datetime.now() - self.last_alert_times[alert_key]).total_seconds()
+            if elapsed < self.alert_cooldown:
+                self.logger.info(f"[{symbol_name}] EMA Alert cooldown active. Next alert in {self.alert_cooldown - elapsed:.0f} seconds")
+                return False
         
         try:
             diff_amount = ltp - ema_value
             diff_percent = (diff_amount / ema_value) * 100
             
-            # Format message for WhatsApp
-            message_body = (
-                f"🔔 *{symbol_name} EMA Alert*\n"
-                f"━━━━━━━━━━━━━━━━━\n"
-                f"📅 *Time:* {timestamp}\n"
-                f"📊 *Symbol:* {symbol}\n\n"
-                f"💰 *LTP:* ₹{ltp:.2f}\n"
-                f"📈 *{ema_period} EMA:* ₹{ema_value:.2f}\n"
-                f"📉 *Difference:* ₹{abs(diff_amount):.2f} ({abs(diff_percent):.2f}%)\n\n"
-                f"✅ LTP has touched the {ema_period} EMA threshold!"
-            )
+            subject = f"🔔 EMA Alert: {symbol_name} touched {ema_period} EMA"
             
-            self.logger.info(f"[{symbol_name}] Sending WhatsApp alert...")
+            body_html = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px;">
+                <h2 style="color: #2c3e50;">🔔 {symbol_name} EMA Alert</h2>
+                <hr style="border: 1px solid #3498db;">
+                
+                <table style="width: 100%; margin-top: 20px;">
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>📅 Time:</strong></td>
+                        <td style="padding: 10px;">{timestamp}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>📊 Symbol:</strong></td>
+                        <td style="padding: 10px;">{symbol}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>💰 LTP:</strong></td>
+                        <td style="padding: 10px;">₹{ltp:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>📈 {ema_period} EMA:</strong></td>
+                        <td style="padding: 10px;">₹{ema_value:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>📉 Difference:</strong></td>
+                        <td style="padding: 10px;">₹{abs(diff_amount):.2f} ({abs(diff_percent):.2f}%)</td>
+                    </tr>
+                </table>
+                
+                <p style="margin-top: 20px; padding: 15px; background-color: #d5f4e6; border-left: 4px solid #27ae60;">
+                    ✅ <strong>LTP has touched the {ema_period} EMA threshold!</strong>
+                </p>
+                
+                <p style="color: #7f8c8d; font-size: 12px; margin-top: 30px;">
+                    This is an automated alert from your EMA Trading Monitor.
+                </p>
+            </body>
+            </html>
+            """
             
-            message = self.client.messages.create(
-                body=message_body,
-                from_=self.from_number,
-                to=self.to_number
-            )
+            self.logger.info(f"[{symbol_name}] Sending EMA email alert...")
             
-            self.logger.info(f"[{symbol_name}] WhatsApp alert sent successfully. SID: {message.sid}")
-            self.last_alert_times[symbol] = datetime.now()
-            return True
+            if self._send_email(subject, body_html):
+                self.logger.info(f"[{symbol_name}] EMA email alert sent successfully")
+                self.last_alert_times[alert_key] = datetime.now()
+                return True
+            
+            return False
             
         except Exception as e:
-            self.logger.error(f"[{symbol_name}] Error sending WhatsApp message: {e}")
+            self.logger.error(f"[{symbol_name}] Error sending EMA email alert: {e}")
+            return False
+    
+    def send_divergence_alert(self, symbol, signal_type, spot_candle, option_candle, timestamp, reason):
+        """Send email alert when divergence signal is detected."""
+        alert_key = f"div_{symbol}_{timestamp.strftime('%Y%m%d%H%M')}"
+        if alert_key in self.last_alert_times:
+            self.logger.info(f"[{symbol}] Divergence alert already sent for this signal")
+            return False
+        
+        try:
+            signal_color = "🟢 GREEN" if signal_type == "PE" else "🔴 RED"
+            option_type = "PUT (PE)" if signal_type == "PE" else "CALL (CE)"
+            
+            subject = f"🎯 Divergence Signal: {signal_type} Buy Opportunity Detected"
+            
+            body_html = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px;">
+                <h2 style="color: #e74c3c;">🎯 Divergence Signal Detected!</h2>
+                <hr style="border: 1px solid #e74c3c;">
+                
+                <div style="background-color: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0;">
+                    <h3 style="margin-top: 0;">Signal Type: {option_type} BUY</h3>
+                    <p><strong>Action Required:</strong> Monitor for breakout above ₹{option_candle['high']:.2f}</p>
+                </div>
+                
+                <h3 style="color: #2c3e50;">📊 Signal Details</h3>
+                <table style="width: 100%; margin-top: 10px;">
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>📅 Time:</strong></td>
+                        <td style="padding: 10px;">{timestamp.strftime('%Y-%m-%d %H:%M:%S')}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>📈 Option Symbol:</strong></td>
+                        <td style="padding: 10px;">{symbol}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>🎯 Entry Trigger:</strong></td>
+                        <td style="padding: 10px;">Price breaks above ₹{option_candle['high']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 10px; background-color: #ecf0f1;"><strong>🛑 Stop Loss:</strong></td>
+                        <td style="padding: 10px;">₹{option_candle['low'] - 0.25:.2f} (Low - 0.25)</td>
+                    </tr>
+                </table>
+                
+                <h3 style="color: #2c3e50; margin-top: 30px;">📉 Spot Candle (Nifty 50)</h3>
+                <table style="width: 100%; margin-top: 10px;">
+                    <tr>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Open:</strong></td>
+                        <td style="padding: 8px;">₹{spot_candle['open']:.2f}</td>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>High:</strong></td>
+                        <td style="padding: 8px;">₹{spot_candle['high']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Low:</strong></td>
+                        <td style="padding: 8px;">₹{spot_candle['low']:.2f}</td>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Close:</strong></td>
+                        <td style="padding: 8px;">₹{spot_candle['close']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Color:</strong></td>
+                        <td colspan="3" style="padding: 8px;">{signal_color}</td>
+                    </tr>
+                </table>
+                
+                <h3 style="color: #2c3e50; margin-top: 20px;">📊 Option Candle ({option_type})</h3>
+                <table style="width: 100%; margin-top: 10px;">
+                    <tr>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Open:</strong></td>
+                        <td style="padding: 8px;">₹{option_candle['open']:.2f}</td>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>High:</strong></td>
+                        <td style="padding: 8px;">₹{option_candle['high']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Low:</strong></td>
+                        <td style="padding: 8px;">₹{option_candle['low']:.2f}</td>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Close:</strong></td>
+                        <td style="padding: 8px;">₹{option_candle['close']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px; background-color: #ecf0f1;"><strong>Color:</strong></td>
+                        <td colspan="3" style="padding: 8px;">🟢 GREEN</td>
+                    </tr>
+                </table>
+                
+                <div style="background-color: #e8f5e9; padding: 15px; border-left: 4px solid #4caf50; margin: 20px 0;">
+                    <h4 style="margin-top: 0;">💡 Divergence Pattern</h4>
+                    <p style="margin: 5px 0;">{reason}</p>
+                </div>
+                
+                <div style="background-color: #fff3e0; padding: 15px; border-left: 4px solid #ff9800; margin: 20px 0;">
+                    <h4 style="margin-top: 0;">⚠️ Trading Plan</h4>
+                    <ul style="margin: 10px 0;">
+                        <li><strong>Wait for Confirmation:</strong> Entry only when price breaks ₹{option_candle['high']:.2f}</li>
+                        <li><strong>Risk Management:</strong> Set stop loss at ₹{option_candle['low'] - 0.25:.2f}</li>
+                        <li><strong>Targets:</strong> 1:1 RR and 1:3 RR from entry</li>
+                        <li><strong>Invalidation:</strong> Signal invalid if price breaks below ₹{option_candle['low']:.2f}</li>
+                    </ul>
+                </div>
+                
+                <p style="color: #7f8c8d; font-size: 12px; margin-top: 30px;">
+                    This is an automated alert from your Divergence Trading Strategy Monitor.<br>
+                    <em>Paper trading mode - No real trades executed.</em>
+                </p>
+            </body>
+            </html>
+            """
+            
+            self.logger.info(f"[{symbol}] Sending divergence email alert...")
+            
+            if self._send_email(subject, body_html):
+                self.logger.info(f"[{symbol}] Divergence email alert sent successfully")
+                self.last_alert_times[alert_key] = datetime.now()
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"[{symbol}] Error sending divergence email alert: {e}")
             return False
 
 
@@ -619,7 +796,7 @@ class MarketScheduler:
 class EMAMonitor:
     """Main class that coordinates all components for EMA monitoring."""
     
-    def __init__(self, access_token, client_id, symbols_config, whatsapp_config):
+    def __init__(self, access_token, client_id, symbols_config, email_config):
         self.access_token = access_token
         self.client_id = client_id
         self.symbols_config = symbols_config
@@ -627,7 +804,7 @@ class EMAMonitor:
         self.logger = logging.getLogger(f"{__name__}.EMAMonitor")
         
         # Initialize components
-        self.whatsapp_notifier = WhatsAppNotifier(**whatsapp_config)
+        self.email_notifier = EmailNotifier(**email_config)
         self.ema_calculator = EMACalculator(symbols_config)
         self.candle_manager = CandleManager(symbols_config, self.timezone)
         self.market_scheduler = MarketScheduler(self.timezone)
@@ -635,8 +812,8 @@ class EMAMonitor:
         # Initialize Fyers Model for API calls (needed for Option Chain)
         self.fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, log_path="")
         
-        # Initialize Divergence Strategy
-        self.divergence_strategy = DivergenceStrategy(self.fyers)
+        # Initialize Divergence Strategy with email notifier
+        self.divergence_strategy = DivergenceStrategy(self.fyers, email_notifier=self.email_notifier)
         self.divergence_strategy.load_capital_state()  # Load saved capital
         self.option_symbols = set() # Track currently subscribed option symbols
         
@@ -787,7 +964,7 @@ class EMAMonitor:
                 self.logger.warning("="*60)
                 self.logger.warning(f"🔔 ALERT: [{config['name']}] LTP (₹{ltp:.2f}) TOUCHED EMA (₹{ema_value:.2f})")
                 self.logger.warning("="*60)
-                self.whatsapp_notifier.send_alert(
+                self.email_notifier.send_ema_alert(
                     symbol, config['name'], ltp, ema_value,
                     config['EMA_PERIOD'], timestamp
                 )
@@ -1085,12 +1262,11 @@ def main():
     }
     
 
-    # WhatsApp configuration - Twilio
-    WHATSAPP_CONFIG = {
-        "account_sid": os.getenv("TWILIO_ACCOUNT_SID"),
-        "auth_token": os.getenv("TWILIO_AUTH_TOKEN"),
-        "from_number": os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886"),
-        "to_number": os.getenv("WHATSAPP_TO", "whatsapp:+917989356894")
+    # Email configuration - Gmail
+    EMAIL_CONFIG = {
+        "gmail_user": os.getenv("GMAIL_USER"),
+        "gmail_app_password": os.getenv("GMAIL_APP_PASSWORD"),
+        "to_email": os.getenv("ALERT_EMAIL")
     }
     
     # Validate configuration
@@ -1099,9 +1275,9 @@ def main():
         logger.error("Please set: CLIENT_ID, SECRET_KEY, USERNAME, PIN, TOTP_KEY")
         return
     
-    if not all([WHATSAPP_CONFIG['account_sid'], WHATSAPP_CONFIG['auth_token']]):
-        logger.error("Missing Twilio WhatsApp configuration!")
-        logger.error("Please set: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN")
+    if not all([EMAIL_CONFIG['gmail_user'], EMAIL_CONFIG['gmail_app_password'], EMAIL_CONFIG['to_email']]):
+        logger.error("Missing Gmail configuration!")
+        logger.error("Please set: GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_EMAIL")
         return
     
     logger.info("="*70)
@@ -1135,7 +1311,7 @@ def main():
             access_token=access_token,
             client_id=CLIENT_ID,
             symbols_config=SYMBOLS_CONFIG,
-            whatsapp_config=WHATSAPP_CONFIG
+            email_config=EMAIL_CONFIG
         )
         
         # Run the 24/7 monitoring service
