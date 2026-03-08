@@ -1,5 +1,0 @@
-the things we need to change :
-** comment out the twillo what'sApp message ,instead we will procced with the gamil message or SMS message [for the email messaging add the required fields to the env file that have already been created the form to to and the App code etc...
-** after this ,make a single sh file when ever the server is up then this need to run automatically (i will run this inside the Ec2 instance ,i have set it up in such a way that the ec2 server will be up in the morning 8 am and then shutdown by itself at 4 pm so )
-
-these are things i want to changes ,i need to collect the forward testing data results for the statergy and need to see how it is performing 
