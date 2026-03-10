@@ -1,107 +1,112 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────
-# run_live.sh — Start both live scripts in background
+# run_live.sh — Run live_runner.py in the EMA conda env
+#
 # Usage:
-#   ./run_live.sh          → start both
-#   ./run_live.sh stop     → stop both
+#   ./run_live.sh          → start
+#   ./run_live.sh stop     → stop
 #   ./run_live.sh status   → check if running
-#   ./run_live.sh logs     → tail both logs live
+#   ./run_live.sh logs     → tail logs live
+#   ./run_live.sh restart  → stop + start
 # ─────────────────────────────────────────────────
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-PID_1MIN="$DIR/.pid_1min"
-PID_5MIN="$DIR/.pid_5min"
-LOG_1MIN="$DIR/live_divergence_1min.log"
-LOG_5MIN="$DIR/live_5min_collector.log"
+PID_FILE="$DIR/.pid_runner"
+LOG_FILE="$DIR/live_runner.log"
+CONDA_ENV="EMA"
+
+# Resolve conda's python from the EMA environment
+PYTHON="$(conda run -n "$CONDA_ENV" which python 2>/dev/null)"
+if [ -z "$PYTHON" ]; then
+    echo "❌ Could not find python in conda env '$CONDA_ENV'. Is conda initialised?"
+    echo "   Try: conda init zsh"
+    exit 1
+fi
 
 start() {
-    echo "═══════════════════════════════════════════════"
-    echo "  🚀 Starting Live Scripts"
-    echo "═══════════════════════════════════════════════"
+    echo "═══════════════════════════════════════════════════"
+    echo "  🚀 Starting Live Runner  [conda env: $CONDA_ENV]"
+    echo "═══════════════════════════════════════════════════"
 
-    # ── 1-min live divergence ──────────────────
-    if [ -f "$PID_1MIN" ] && kill -0 "$(cat "$PID_1MIN")" 2>/dev/null; then
-        echo "  ⚠️  live_divergence_1min.py already running (PID $(cat $PID_1MIN))"
-    else
-        nohup python3 "$DIR/live_divergence_1min.py" >> "$LOG_1MIN" 2>&1 &
-        echo $! > "$PID_1MIN"
-        echo "  ✅ live_divergence_1min.py started  → PID $! | Log: $LOG_1MIN"
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "  ⚠️  Already running (PID $(cat $PID_FILE))"
+        return
     fi
 
-    # ── 5-min data collector ───────────────────
-    if [ -f "$PID_5MIN" ] && kill -0 "$(cat "$PID_5MIN")" 2>/dev/null; then
-        echo "  ⚠️  live_5min_collector.py already running (PID $(cat $PID_5MIN))"
-    else
-        nohup python3 "$DIR/live_5min_collector.py" >> "$LOG_5MIN" 2>&1 &
-        echo $! > "$PID_5MIN"
-        echo "  ✅ live_5min_collector.py started   → PID $! | Log: $LOG_5MIN"
-    fi
-
-    echo "───────────────────────────────────────────────"
-    echo "  Use:  ./run_live.sh logs    → to watch both logs"
-    echo "        ./run_live.sh stop    → to stop both"
-    echo "═══════════════════════════════════════════════"
+    cd "$DIR"
+    nohup "$PYTHON" "$DIR/live_runner.py" >> "$LOG_FILE" 2>&1 &
+    PID=$!
+    echo $PID > "$PID_FILE"
+    echo "  ✅ live_runner.py started → PID $PID"
+    echo "     Log  : $LOG_FILE"
+    echo "─────────────────────────────────────────────────"
+    echo "  ./run_live.sh logs    → watch logs"
+    echo "  ./run_live.sh stop    → stop"
+    echo "═══════════════════════════════════════════════════"
 }
 
 stop() {
-    echo "═══════════════════════════════════════════════"
-    echo "  🛑 Stopping Live Scripts"
-    echo "═══════════════════════════════════════════════"
+    echo "═══════════════════════════════════════════════════"
+    echo "  🛑 Stopping Live Runner"
+    echo "═══════════════════════════════════════════════════"
 
-    for pidf in "$PID_1MIN" "$PID_5MIN"; do
-        if [ -f "$pidf" ]; then
-            pid=$(cat "$pidf")
-            name=$(basename "$pidf" | sed 's/.pid_//')
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid"
-                echo "  ✅ Stopped PID $pid ($pidf)"
-            else
-                echo "  ℹ️  PID $pid already stopped ($pidf)"
-            fi
-            rm -f "$pidf"
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            kill "$PID"
+            echo "  ✅ Stopped PID $PID"
         else
-            echo "  ℹ️  No PID file: $pidf (not running?)"
+            echo "  ℹ️  PID $PID already stopped (stale)"
         fi
-    done
-    echo "═══════════════════════════════════════════════"
+        rm -f "$PID_FILE"
+    else
+        echo "  ℹ️  Not running (no PID file)"
+    fi
+    echo "═══════════════════════════════════════════════════"
 }
 
 status() {
-    echo "═══════════════════════════════════════════════"
+    echo "═══════════════════════════════════════════════════"
     echo "  📊 Status"
-    echo "═══════════════════════════════════════════════"
-    for pidf in "$PID_1MIN" "$PID_5MIN"; do
-        label=$(basename "$pidf")
-        if [ -f "$pidf" ]; then
-            pid=$(cat "$pidf")
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "  🟢 RUNNING  $label  (PID $pid)"
-            else
-                echo "  🔴 DEAD     $label  (PID $pid — stale)"
-            fi
+    echo "═══════════════════════════════════════════════════"
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "  🟢 RUNNING  live_runner.py  (PID $PID)"
+            echo "     Uptime : $(ps -p "$PID" -o etime= 2>/dev/null | xargs)"
+            echo "     Log    : $LOG_FILE"
         else
-            echo "  ⚪ STOPPED  $label"
+            echo "  🔴 DEAD     live_runner.py  (PID $PID — stale)"
+            rm -f "$PID_FILE"
         fi
-    done
-    echo "═══════════════════════════════════════════════"
+    else
+        echo "  ⚪ STOPPED  live_runner.py"
+    fi
+    echo "═══════════════════════════════════════════════════"
 }
 
 logs() {
-    echo "═══════════════════════════════════════════════"
-    echo "  📜 Tailing both logs (Ctrl+C to stop)"
-    echo "═══════════════════════════════════════════════"
-    # tail both logs with file label prefix
-    tail -f "$LOG_1MIN" "$LOG_5MIN"
+    echo "═══════════════════════════════════════════════════"
+    echo "  📜 Tailing: $LOG_FILE  (Ctrl+C to stop)"
+    echo "═══════════════════════════════════════════════════"
+    tail -f "$LOG_FILE"
+}
+
+restart() {
+    stop
+    sleep 2
+    start
 }
 
 # ── Entry point ────────────────────────────────
 case "${1:-start}" in
-    start)  start  ;;
-    stop)   stop   ;;
-    status) status ;;
-    logs)   logs   ;;
+    start)   start   ;;
+    stop)    stop    ;;
+    status)  status  ;;
+    logs)    logs    ;;
+    restart) restart ;;
     *)
-        echo "Usage: $0 {start|stop|status|logs}"
+        echo "Usage: $0 {start|stop|status|logs|restart}"
         exit 1
         ;;
 esac
