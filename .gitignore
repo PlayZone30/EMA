@@ -1,2 +1,4 @@
 .env
 __pycache__/
+/analysis_output
+/data_5min

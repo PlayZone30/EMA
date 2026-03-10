@@ -25,6 +25,7 @@ import time
 import pytz
 import logging
 import dotenv
+import threading
 from datetime import datetime, time as dt_time, timedelta
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
@@ -247,6 +248,11 @@ class LiveDivergenceEngine:
         self.spot_ltp = None
         self.last_option_refresh = 0
 
+        # Thread safety for option refresh
+        self._symbol_lock = threading.Lock()
+        self._refresh_thread = None
+        self._known_symbols = set()  # Track all subscribed option symbols
+
         # Candle manager
         self.candle_manager = CandleManager1Min()
 
@@ -405,43 +411,93 @@ class LiveDivergenceEngine:
             logger.error(f"Error finding options: {e}", exc_info=True)
             return None, None
 
-    def maybe_refresh_options(self):
-        """Refresh option selection every OPTION_REFRESH_SECONDS."""
-        now = time.time()
-        if now - self.last_option_refresh < OPTION_REFRESH_SECONDS:
-            return
+    def _option_refresh_worker(self):
+        """
+        Background thread that refreshes option selection periodically.
+        Runs every OPTION_REFRESH_SECONDS. Never blocks the WS message handler.
+        """
+        logger.info("🔄 Option refresh thread started.")
+        while self.is_running:
+            time.sleep(OPTION_REFRESH_SECONDS)
 
-        # Don't refresh if there's an active trade (would mess up tracking)
-        if self.active_trade is not None:
-            return
+            if not self.is_running:
+                break
 
-        self.last_option_refresh = now
-        logger.info("🔄 Refreshing option selection...")
+            # Don't refresh if there's an active trade
+            if self.active_trade is not None:
+                logger.info("🔄 Option refresh skipped (active trade)")
+                continue
 
-        new_ce, new_pe = self.find_options_in_range()
-        if not new_ce or not new_pe:
-            return
+            try:
+                logger.info("🔄 Refreshing option selection...")
+                new_ce, new_pe = self.find_options_in_range()
+                if not new_ce or not new_pe:
+                    logger.warning("🔄 Refresh failed — keeping current options")
+                    continue
 
-        if new_ce != self.ce_symbol or new_pe != self.pe_symbol:
-            # Unsubscribe old
-            old_symbols = [s for s in [self.ce_symbol, self.pe_symbol] if s]
-            if old_symbols and self.fyers_ws:
-                try:
-                    self.fyers_ws.unsubscribe(symbols=old_symbols)
-                except:
-                    pass
+                with self._symbol_lock:
+                    ce_changed = new_ce != self.ce_symbol
+                    pe_changed = new_pe != self.pe_symbol
 
-            self.ce_symbol = new_ce
-            self.pe_symbol = new_pe
+                    if not ce_changed and not pe_changed:
+                        logger.info("🔄 Options unchanged, no rotation needed.")
+                        continue
 
-            # Clear candle history for old symbols
-            self.candle_history = {}
-            self.pending_signals = {}
+                    # Build unsub/sub lists
+                    unsub = []
+                    sub = []
 
-            # Subscribe new
-            if self.fyers_ws:
-                self.fyers_ws.subscribe(symbols=[new_ce, new_pe], data_type="SymbolUpdate")
-                logger.info(f"📡 Subscribed to new options: CE={new_ce}, PE={new_pe}")
+                    if ce_changed:
+                        if self.ce_symbol:
+                            unsub.append(self.ce_symbol)
+                        sub.append(new_ce)
+                        logger.info(f"  CE rotation: {self.ce_symbol} → {new_ce}")
+                        self.ce_symbol = new_ce
+                        self.ce_ltp = None  # Reset LTP for new symbol
+
+                    if pe_changed:
+                        if self.pe_symbol:
+                            unsub.append(self.pe_symbol)
+                        sub.append(new_pe)
+                        logger.info(f"  PE rotation: {self.pe_symbol} → {new_pe}")
+                        self.pe_symbol = new_pe
+                        self.pe_ltp = None
+
+                    # Update known symbols set
+                    for s in unsub:
+                        self._known_symbols.discard(s)
+                    for s in sub:
+                        self._known_symbols.add(s)
+
+                    # Clear candle history for changed symbols
+                    self.candle_history = {k: v for k, v in self.candle_history.items()
+                                           if k == SPOT_SYMBOL}
+                    self.pending_signals = {}
+
+                # Do unsubscribe/subscribe OUTSIDE the lock (avoid deadlock)
+                if self.fyers_ws:
+                    if unsub:
+                        try:
+                            self.fyers_ws.unsubscribe(symbols=unsub)
+                            logger.info(f"  Unsubscribed: {unsub}")
+                            time.sleep(0.3)  # Small delay between unsub and sub
+                        except Exception as e:
+                            logger.error(f"  Unsubscribe error: {e}")
+
+                    if sub:
+                        try:
+                            self.fyers_ws.subscribe(symbols=sub, data_type="SymbolUpdate")
+                            logger.info(f"  📡 Subscribed: {sub}")
+                        except Exception as e:
+                            logger.error(f"  Subscribe error: {e}")
+
+                    self.last_option_refresh = time.time()
+                    logger.info(f"📡 Option refresh complete. CE={self.ce_symbol}, PE={self.pe_symbol}")
+
+            except Exception as e:
+                logger.error(f"Option refresh error: {e}", exc_info=True)
+
+        logger.info("🔄 Option refresh thread stopped.")
 
     # ========== DIVERGENCE SIGNAL DETECTION ==========
 
@@ -525,15 +581,19 @@ class LiveDivergenceEngine:
             ltp = message['ltp']
             now = datetime.now(IST)
 
-            # Track LTPs
+            # Track LTPs (thread-safe read of symbol names)
+            with self._symbol_lock:
+                current_ce = self.ce_symbol
+                current_pe = self.pe_symbol
+
             if symbol == SPOT_SYMBOL:
                 self.spot_ltp = ltp
-            elif symbol == self.ce_symbol:
+            elif symbol == current_ce:
                 self.ce_ltp = ltp
-            elif symbol == self.pe_symbol:
+            elif symbol == current_pe:
                 self.pe_ltp = ltp
             else:
-                return  # Unknown symbol
+                return  # Unknown symbol (old rotated symbol or noise)
 
             # Check market hours
             current_time = now.time()
@@ -569,8 +629,7 @@ class LiveDivergenceEngine:
                 if symbol == SPOT_SYMBOL:
                     self.check_divergence(now)
 
-            # --- 4. OPTION REFRESH ---
-            self.maybe_refresh_options()
+            # --- 4. OPTION REFRESH (handled by background thread) ---
 
             # --- 5. STATUS LINE ---
             self._print_status(now)
@@ -777,6 +836,7 @@ class LiveDivergenceEngine:
             return
 
         self.last_option_refresh = time.time()
+        self._known_symbols = {self.ce_symbol, self.pe_symbol}
 
         # Step 4: Connect WebSocket
         logger.info("📡 Connecting WebSocket...")
@@ -793,6 +853,15 @@ class LiveDivergenceEngine:
                 on_message=self._on_message,
             )
             self.fyers_ws.connect()
+
+            # Step 5: Start option refresh background thread
+            self._refresh_thread = threading.Thread(
+                target=self._option_refresh_worker,
+                daemon=True,
+                name="OptionRefresh"
+            )
+            self._refresh_thread.start()
+            logger.info("🔄 Option refresh thread started (every 5 min)")
 
             # Keep alive until market close
             while self.is_running:
