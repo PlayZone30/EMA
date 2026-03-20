@@ -1,6 +1,6 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────
-# run_live.sh — Run live_runner.py in the EMA conda env
+# run_live.sh — Manage live_runner.py
 #
 # Usage:
 #   ./run_live.sh          → start
@@ -15,17 +15,48 @@ PID_FILE="$DIR/.pid_runner"
 LOG_FILE="$DIR/live_runner.log"
 CONDA_ENV="EMA"
 
-# Resolve conda's python from the EMA environment
-PYTHON="$(conda run -n "$CONDA_ENV" which python 2>/dev/null)"
+# ── Find Python from conda EMA env ────────────────
+# Try common conda install locations (macOS + Ubuntu EC2)
+find_python() {
+    # Direct env binary (most reliable, no conda init needed)
+    for PREFIX in \
+        "$HOME/miniconda3/envs/$CONDA_ENV" \
+        "$HOME/anaconda3/envs/$CONDA_ENV" \
+        "/opt/miniconda3/envs/$CONDA_ENV" \
+        "/opt/anaconda3/envs/$CONDA_ENV" \
+        "/home/ubuntu/miniconda3/envs/$CONDA_ENV" \
+        "/home/ubuntu/anaconda3/envs/$CONDA_ENV"
+    do
+        if [ -x "$PREFIX/bin/python" ]; then
+            echo "$PREFIX/bin/python"
+            return 0
+        fi
+    done
+
+    # Fallback: try conda run
+    local p
+    p=$(conda run -n "$CONDA_ENV" which python 2>/dev/null)
+    if [ -n "$p" ]; then
+        echo "$p"
+        return 0
+    fi
+
+    return 1
+}
+
+PYTHON=$(find_python)
 if [ -z "$PYTHON" ]; then
-    echo "❌ Could not find python in conda env '$CONDA_ENV'. Is conda initialised?"
-    echo "   Try: conda init zsh"
+    echo "❌ Cannot find python in conda env '$CONDA_ENV'."
+    echo "   Tried common paths. Make sure conda is installed and the '$CONDA_ENV' env exists."
     exit 1
 fi
+
+# ─────────────────────────────────────────────────
 
 start() {
     echo "═══════════════════════════════════════════════════"
     echo "  🚀 Starting Live Runner  [conda env: $CONDA_ENV]"
+    echo "  Python: $PYTHON"
     echo "═══════════════════════════════════════════════════"
 
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
@@ -54,6 +85,7 @@ stop() {
         PID=$(cat "$PID_FILE")
         if kill -0 "$PID" 2>/dev/null; then
             kill "$PID"
+            sleep 2     # give it time to flush CSVs and log EOD report
             echo "  ✅ Stopped PID $PID"
         else
             echo "  ℹ️  PID $PID already stopped (stale)"
@@ -98,7 +130,6 @@ restart() {
     start
 }
 
-# ── Entry point ────────────────────────────────
 case "${1:-start}" in
     start)   start   ;;
     stop)    stop    ;;

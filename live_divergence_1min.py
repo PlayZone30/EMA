@@ -625,6 +625,14 @@ class LiveDivergenceEngine:
             completed_candle = self.candle_manager.update(symbol, ltp)
             if completed_candle:
                 self._store_candle(symbol, completed_candle)
+                
+                # Expiration: If a full 1-min candle completed and signal didn't trigger -> expire (Strict Case 1)
+                if symbol in self.pending_signals:
+                    sig = self.pending_signals[symbol]
+                    if completed_candle['time'] > sig['candle']['time']:
+                        logger.info(f"  ❌ Signal expired for {symbol} (No breakout in next candle)")
+                        del self.pending_signals[symbol]
+                
                 # Check for divergence on spot candle completion
                 if symbol == SPOT_SYMBOL:
                     self.check_divergence(now)

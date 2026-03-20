@@ -2,3 +2,9 @@
 __pycache__/
 /analysis_output
 /data_5min
+/2024
+/2024_daywise_spot
+/2024_daywise
+
+/*.csv
+
