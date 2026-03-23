@@ -37,7 +37,7 @@ from live_divergence_1min import (
     SPOT_SYMBOL,
     API_DELAY,
 )
-from live_5min_collector import LiveDataCollector
+from live_5min_collector import Live5MinEngine, MARKET_OPEN as MARKET_OPEN_5MIN
 
 dotenv.load_dotenv()
 
@@ -94,7 +94,7 @@ class UnifiedRunner:
 
     Delegates:
       - 1-min tick processing → LiveDivergenceEngine._process_tick()
-      - 5-min tick processing → LiveDataCollector._process_tick()
+      - 5-min tick processing → Live5MinEngine._process_tick()
     """
 
     def __init__(self):
@@ -113,7 +113,7 @@ class UnifiedRunner:
 
         # Strategy engines — created after auth so they can share fyers
         self.engine_1min  = None    # LiveDivergenceEngine
-        self.engine_5min  = None    # LiveDataCollector
+        self.engine_5min  = None    # Live5MinEngine
 
     # ── Auth + Engine Init ─────────────────────
     def _setup(self):
@@ -128,7 +128,7 @@ class UnifiedRunner:
         self.engine_1min.access_token = self.access_token
         self.engine_1min.client_id    = self.client_id
 
-        self.engine_5min = LiveDataCollector.__new__(LiveDataCollector)
+        self.engine_5min = Live5MinEngine.__new__(Live5MinEngine)
         self.engine_5min.__init__()
         self.engine_5min.fyers        = self.fyers
         self.engine_5min.access_token = self.access_token
@@ -158,9 +158,9 @@ class UnifiedRunner:
                 logger.info("🔄 Refresh skipped — active trade in progress.")
                 continue
 
-            # Skip if 5-min engine has active signals being watched
-            if self.engine_5min.active_signals:
-                logger.info("🔄 Refresh skipped — 5-min signals being tracked.")
+            # Skip if 5-min engine has active trade/signals
+            if self.engine_5min.active_trade is not None or len(self.engine_5min.pending_signals) > 0:
+                logger.info("🔄 Refresh skipped — 5-min active trade/signals.")
                 continue
 
             try:
@@ -206,11 +206,11 @@ class UnifiedRunner:
                         k: v for k, v in self.engine_1min.candle_history.items()
                         if k == SPOT_SYMBOL
                     }
-                    self.engine_5min.candle_hist = {
-                        k: v for k, v in self.engine_5min.candle_hist.items()
+                    self.engine_5min.pending_signals = {}
+                    self.engine_5min.candle_history = {
+                        k: v for k, v in self.engine_5min.candle_history.items()
                         if k == SPOT_SYMBOL
                     }
-                    self.engine_5min.active_signals = []
 
                 if self.fyers_ws:
                     if unsub:
@@ -258,13 +258,11 @@ class UnifiedRunner:
             else:
                 return  # Old/unknown symbol
 
-            current_bucket = self.engine_5min.candle_mgr._bucket()
-
             # ── 1-min engine tick processing ──
             self._tick_1min(symbol, ltp, now, cur_ce, cur_pe)
 
             # ── 5-min engine tick processing ──
-            self._tick_5min(symbol, ltp, now, cur_ce, cur_pe, current_bucket)
+            self._tick_5min(symbol, ltp, now, cur_ce, cur_pe)
 
             # ── Status ─────────────────────
             self._status(now)
@@ -292,9 +290,9 @@ class UnifiedRunner:
         # Pending signal entry check
         if symbol in eng.pending_signals and eng.active_trade is None:
             sig = eng.pending_signals[symbol]
-            if ltp < sig["low"]:
+            if ltp <= sig["low"]:
                 del eng.pending_signals[symbol]
-            elif ltp > sig["high"]:
+            elif ltp >= sig["high"]:
                 eng._enter_trade(symbol, ltp, now, sig)
                 del eng.pending_signals[symbol]
 
@@ -302,55 +300,56 @@ class UnifiedRunner:
         completed = eng.candle_manager.update(symbol, ltp)
         if completed:
             eng._store_candle(symbol, completed)
+            
+            # Expiration strict Case 1 logic
+            if symbol in eng.pending_signals:
+                sig = eng.pending_signals[symbol]
+                if completed["time"] > sig["candle"]["time"]:
+                    logger.info(f"  ❌ 1m Signal expired for {symbol}")
+                    del eng.pending_signals[symbol]
+                    
             if symbol == SPOT_SYMBOL:
                 eng.check_divergence(now)
 
-    def _tick_5min(self, symbol, ltp, now, cur_ce, cur_pe, current_bucket):
-        """Forward tick to 5-min collector logic."""
+    def _tick_5min(self, symbol, ltp, now, cur_ce, cur_pe):
         eng = self.engine_5min
 
         if now.time() > MARKET_CLOSE:
             if eng.is_running:
                 eng.is_running = False
-                eng._eod(now)
+                eng._handle_eod(now)
             return
 
-        # Feed tick to all watching signals
-        done = []
-        for sig in eng.active_signals:
-            if (sig.option == "CE" and symbol == cur_ce) or \
-               (sig.option == "PE" and symbol == cur_pe):
-                result = sig.tick(ltp, now, current_bucket)
-                if result:
-                    done.append((sig, result))
+        # Active trade management
+        if eng.active_trade is not None and symbol == eng.active_trade.symbol:
+            result = eng.active_trade.update_tick(ltp, now)
+            if result:
+                eng._handle_trade_exit(result)
 
-        for s, r in done:
-            eng._log_result(r)
-            if s in eng.active_signals:
-                eng.active_signals.remove(s)
+        # Pending signal entry check
+        if symbol in eng.pending_signals and eng.active_trade is None and now.time() >= MARKET_OPEN_5MIN:
+            sig = eng.pending_signals[symbol]
+            if ltp <= sig["low"]:
+                del eng.pending_signals[symbol]
+            elif ltp >= sig["high"]:
+                eng._enter_trade(symbol, ltp, now, sig)
+                del eng.pending_signals[symbol]
 
         # 5-min candle building
-        completed = eng.candle_mgr.update(symbol, ltp)
+        completed = eng.candle_manager.update(symbol, ltp)
         if completed:
             eng._store_candle(symbol, completed)
 
-            # Candle close → update signal states
-            done2 = []
-            for sig in eng.active_signals:
-                if (sig.option == "CE" and symbol == cur_ce) or \
-                   (sig.option == "PE" and symbol == cur_pe):
-                    result = sig.on_new_candle(completed, current_bucket)
-                    if result:
-                        done2.append((sig, result))
-
-            for s, r in done2:
-                eng._log_result(r)
-                if s in eng.active_signals:
-                    eng.active_signals.remove(s)
+            # Expiration
+            if symbol in eng.pending_signals and cur_ce and cur_pe:
+                sig = eng.pending_signals[symbol]
+                if float(now.timestamp()) > sig['expire_tick']:
+                    logger.info(f"  ❌ 5m Signal expired for {symbol}")
+                    del eng.pending_signals[symbol]
 
             # New 5-min divergence signal detection (on spot candle close)
             if symbol == SPOT_SYMBOL:
-                eng._detect_signals(now)
+                eng.check_divergence(now)
 
     # ── Status Line ────────────────────────────
     def _status(self, now):
@@ -362,10 +361,13 @@ class UnifiedRunner:
             parts.append(f"NIFTY:{e1.spot_ltp:.2f}")
         with self._symbol_lock:
             ce, pe = self.ce_symbol, self.pe_symbol
+            
         if ce and e1.ce_ltp:
-            parts.append(f"CE:₹{e1.ce_ltp:.2f}")
+            ce_s = ce[-10:] if len(ce) > 10 else ce
+            parts.append(f"CE({ce_s}):₹{e1.ce_ltp:.2f}")
         if pe and e1.pe_ltp:
-            parts.append(f"PE:₹{e1.pe_ltp:.2f}")
+            pe_s = pe[-10:] if len(pe) > 10 else pe
+            parts.append(f"PE({pe_s}):₹{e1.pe_ltp:.2f}")
 
         # 1-min trade status
         if e1.active_trade:
@@ -375,9 +377,13 @@ class UnifiedRunner:
             parts.append(f"[1m]PnL:₹{e1.daily_pnl:+.2f}")
 
         # 5-min observer status
-        parts.append(f"[5m]Watching:{len(e5.active_signals)} V:{e5.valid_count}/I:{e5.invalid_count}")
+        if e5.active_trade:
+            t = e5.active_trade
+            parts.append(f"[5m]TRADE:{t.trade_type} SL:{t.sl:.2f} TP:{t.tp:.2f}")
+        else:
+            parts.append(f"[5m]PnL:₹{e5.daily_pnl:+.2f} Watched:{len(e5.pending_signals)}")
 
-        print(f"\r{'  |  '.join(parts):<200}", end="", flush=True)
+        print(f"\r{'  |  '.join(parts):<160}", end="", flush=True)
 
     # ── WebSocket Callbacks ─────────────────────
     def _on_open(self):
@@ -404,7 +410,7 @@ class UnifiedRunner:
         logger.info("=" * 65)
         logger.info("🚀 UNIFIED LIVE RUNNER")
         logger.info("   ├── 1-min Divergence Paper Trader (₹60-70 options)")
-        logger.info("   └── 5-min Divergence Data Collector (Case 1/2/3/4)")
+        logger.info("   └── 5-min Divergence Paper Trader (Case 1 Risk Sizing)")
         logger.info("=" * 65)
 
         # Auth + engine init
@@ -482,13 +488,13 @@ class UnifiedRunner:
             logger.info("⚠️  Interrupted.")
             now = datetime.now(IST)
             self.engine_1min._handle_eod(now)
-            self.engine_5min._eod(now)
+            self.engine_5min._handle_eod(now)
 
         except Exception as e:
             logger.error(f"Fatal: {e}", exc_info=True)
             now = datetime.now(IST)
             self.engine_1min._handle_eod(now)
-            self.engine_5min._eod(now)
+            self.engine_5min._handle_eod(now)
 
 
 # ─────────────────────────────────────────────
