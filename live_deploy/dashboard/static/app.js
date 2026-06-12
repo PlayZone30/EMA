@@ -35,6 +35,12 @@ function toIST(utcEpoch) {
     return utcEpoch + IST_OFFSET;
 }
 
+function toBarTime(utcEpoch) {
+    // Markers must sit exactly on a bar time: floor intra-candle
+    // timestamps (entry/exit ticks) to their 5-min bucket, then shift
+    return toIST(Math.floor(utcEpoch / 300) * 300);
+}
+
 function formatINR(val) {
     if (val == null) return '—';
     const sign = val >= 0 ? '+' : '-';
@@ -366,7 +372,7 @@ async function addTradeMarkers(symbol, series) {
         // Entry marker
         if (t.entry_time) {
             try {
-                const entryTs = toIST(Math.floor(new Date(t.entry_time).getTime() / 1000));
+                const entryTs = toBarTime(new Date(t.entry_time).getTime() / 1000);
                 markers.push({
                     time: entryTs,
                     position: 'belowBar',
@@ -380,7 +386,7 @@ async function addTradeMarkers(symbol, series) {
         // Exit marker
         if (t.exit_time) {
             try {
-                const exitTs = toIST(Math.floor(new Date(t.exit_time).getTime() / 1000));
+                const exitTs = toBarTime(new Date(t.exit_time).getTime() / 1000);
                 markers.push({
                     time: exitTs,
                     position: 'aboveBar',
@@ -555,7 +561,7 @@ async function openTradeModal(tradeId) {
             // Signal candle marker
             if (t.signal_time) {
                 try {
-                    const sigTs = toIST(Math.floor(new Date(t.signal_time).getTime() / 1000));
+                    const sigTs = toBarTime(new Date(t.signal_time).getTime() / 1000);
                     mSpotSeries.setMarkers([{
                         time: sigTs, position: 'belowBar', color: '#f59e0b', shape: 'circle', text: 'SIG',
                     }]);
@@ -596,7 +602,7 @@ async function openTradeModal(tradeId) {
             if (t.entry_time) {
                 try {
                     markers.push({
-                        time: toIST(Math.floor(new Date(t.entry_time).getTime() / 1000)),
+                        time: toBarTime(new Date(t.entry_time).getTime() / 1000),
                         position: 'belowBar', color: '#22c55e', shape: 'arrowUp',
                         text: `ENTRY ${Number(t.entry_price).toFixed(1)}`,
                     });
@@ -605,7 +611,7 @@ async function openTradeModal(tradeId) {
             if (t.exit_time) {
                 try {
                     markers.push({
-                        time: toIST(Math.floor(new Date(t.exit_time).getTime() / 1000)),
+                        time: toBarTime(new Date(t.exit_time).getTime() / 1000),
                         position: 'aboveBar',
                         color: t.exit_reason === 'TP' ? '#22c55e' : '#ef4444',
                         shape: 'arrowDown',
@@ -616,7 +622,7 @@ async function openTradeModal(tradeId) {
             if (t.signal_time) {
                 try {
                     markers.push({
-                        time: toIST(Math.floor(new Date(t.signal_time).getTime() / 1000)),
+                        time: toBarTime(new Date(t.signal_time).getTime() / 1000),
                         position: 'belowBar', color: '#f59e0b', shape: 'circle', text: 'SIG',
                     });
                 } catch {}
