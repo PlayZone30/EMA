@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Trading Dashboard — NIFTY 5-Min Divergence</title>
+    <meta name="description" content="Real-time paper trading dashboard for NIFTY 50 options divergence strategy with live charts, trade journal, and event feed.">
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    
+    <!-- Lightweight Charts v4.2.3 (pinned) -->
+    <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    
+    <!-- Styles -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- HEADER -->
+    <header class="header" id="header">
+        <div class="header-inner">
+            <div class="header-brand">
+                <div class="live-dot" id="liveDot"></div>
+                <h1>NIFTY Divergence Trader</h1>
+                <span class="stale-badge" id="staleBadge" style="display:none"></span>
+            </div>
+            <div class="header-metrics">
+                <div class="metric">
+                    <span class="metric-label">Capital</span>
+                    <span class="metric-value neutral" id="capitalValue">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Day P&L</span>
+                    <span class="metric-value neutral" id="pnlValue">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Spot</span>
+                    <span class="metric-value neutral" id="spotValue">—</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">Signals</span>
+                    <span class="metric-value neutral" id="signalsValue">0</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- MAIN CONTENT -->
+    <main class="main-content">
+
+        <!-- Active Trade Card -->
+        <div class="card active-trade-card" id="activeTradeCard" style="display:none">
+            <div class="card-header">
+                <span class="card-title">🟢 Active Trade</span>
+                <span class="metric-value" id="tradeUnrealizedPnl">—</span>
+            </div>
+            <div class="card-body">
+                <div class="trade-grid" id="activeTradeGrid">
+                    <!-- Filled by JS -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Pending Signals -->
+        <div class="card" id="signalsCard">
+            <div class="card-header">
+                <span class="card-title">⚡ Pending Signals</span>
+            </div>
+            <div class="signal-chips" id="signalChips">
+                <span class="no-signals">No active signals</span>
+            </div>
+        </div>
+
+        <!-- Charts Section -->
+        <div class="charts-section">
+            <div class="card chart-container">
+                <div class="card-header">
+                    <span class="card-title">NIFTY 50 Spot</span>
+                </div>
+                <div class="card-body" id="spotChartContainer"></div>
+            </div>
+            <div class="card chart-container">
+                <div class="card-header">
+                    <span class="card-title" id="optionChartTitle">Option</span>
+                    <div class="chart-toggle" id="optionToggle">
+                        <button class="active" data-type="ce" id="btnCE">CE</button>
+                        <button data-type="pe" id="btnPE">PE</button>
+                    </div>
+                </div>
+                <div class="card-body" id="optionChartContainer"></div>
+            </div>
+        </div>
+
+        <!-- Bottom: Trade Log + Event Feed -->
+        <div class="bottom-section">
+            <!-- Trade Log -->
+            <div class="card">
+                <div class="card-header trade-log-header">
+                    <span class="card-title">📋 Trade Journal</span>
+                    <select class="date-filter" id="dateFilter">
+                        <option value="">Today</option>
+                    </select>
+                </div>
+                <div class="card-body">
+                    <div class="trade-list" id="tradeList">
+                        <div class="no-trades">No trades yet</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Event Feed -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📡 Activity Feed</span>
+                </div>
+                <div class="card-body event-feed" id="eventFeed">
+                    <div class="no-events">No events yet</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Trade Detail Modal -->
+    <div class="modal-overlay" id="tradeModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 id="modalTitle">Trade Detail</h2>
+                <button class="modal-close" id="modalClose">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <!-- Filled by JS -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

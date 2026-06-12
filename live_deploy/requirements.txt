@@ -1,0 +1,9 @@
+fyers-apiv3
+pyotp
+requests
+pytz
+schedule
+python-dotenv
+setuptools
+fastapi
+uvicorn[standard]

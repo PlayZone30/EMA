@@ -12,3 +12,10 @@ __pycache__/
 /*.csv
 
 
+# Live deploy runtime artifacts
+live_deploy/*.db
+live_deploy/*.db-wal
+live_deploy/*.db-shm
+live_deploy/*.log
+live_deploy/__pycache__/
+live_deploy/dashboard/__pycache__/
