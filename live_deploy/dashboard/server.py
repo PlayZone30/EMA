@@ -79,34 +79,48 @@ def api_candles(
     symbol: str = Query(..., description="Symbol to fetch candles for"),
     from_ts: int = Query(None, alias="from", description="Start timestamp (UTC epoch)"),
     to_ts: int = Query(None, alias="to", description="End timestamp (UTC epoch)"),
+    date: str = Query(None, description="Trading date YYYY-MM-DD (overrides from/to)"),
 ):
     """Get OHLC candle data for a symbol."""
     try:
+        import pytz
+        ist = pytz.timezone('Asia/Kolkata')
         conn = get_db()
         query = "SELECT bucket_time as time, open, high, low, close FROM candles WHERE symbol = ?"
         params = [symbol]
-        
-        if from_ts is not None:
-            query += " AND bucket_time >= ?"
-            params.append(from_ts)
-        if to_ts is not None:
-            query += " AND bucket_time <= ?"
-            params.append(to_ts)
-        
-        # Default: today's candles (IST: UTC+5:30)
-        if from_ts is None and to_ts is None:
-            # Start of today IST = midnight IST in UTC epoch
-            import pytz
-            ist = pytz.timezone('Asia/Kolkata')
-            today_ist = datetime.now(ist).replace(hour=0, minute=0, second=0, microsecond=0)
-            today_utc_epoch = int(today_ist.timestamp())
-            query += " AND bucket_time >= ?"
-            params.append(today_utc_epoch)
-        
+
+        if date:
+            # Explicit date: full IST day window
+            from datetime import date as date_type
+            d = datetime.strptime(date, "%Y-%m-%d")
+            day_start = ist.localize(d.replace(hour=0, minute=0, second=0, microsecond=0))
+            day_end   = ist.localize(d.replace(hour=23, minute=59, second=59, microsecond=0))
+            query += " AND bucket_time >= ? AND bucket_time <= ?"
+            params += [int(day_start.timestamp()), int(day_end.timestamp())]
+        elif from_ts is not None or to_ts is not None:
+            if from_ts is not None:
+                query += " AND bucket_time >= ?"
+                params.append(from_ts)
+            if to_ts is not None:
+                query += " AND bucket_time <= ?"
+                params.append(to_ts)
+        else:
+            # Default: use the most recent date that has candle data for this symbol
+            latest = conn.execute(
+                "SELECT MAX(bucket_time) as mx FROM candles WHERE symbol = ?", (symbol,)
+            ).fetchone()
+            if latest and latest['mx']:
+                latest_dt = datetime.fromtimestamp(latest['mx'], tz=ist)
+                day_start = ist.localize(
+                    datetime(latest_dt.year, latest_dt.month, latest_dt.day, 0, 0, 0)
+                )
+                query += " AND bucket_time >= ?"
+                params.append(int(day_start.timestamp()))
+            # else: no candles at all — return empty
+
         query += " ORDER BY bucket_time ASC"
         rows = conn.execute(query, params).fetchall()
         conn.close()
-        
         return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"API candles error: {e}")
@@ -115,28 +129,111 @@ def api_candles(
 
 @app.get("/api/trades")
 def api_trades(
-    date: str = Query(None, description="Filter by date (YYYY-MM-DD) or 'all'"),
+    date: str = Query(None, description="Filter by date (YYYY-MM-DD), 'all', or omit for most recent"),
 ):
     """Get trade records, optionally filtered by date."""
     try:
+        import pytz
+        ist = pytz.timezone('Asia/Kolkata')
         conn = get_db()
-        
-        if date and date != 'all':
-            rows = conn.execute("SELECT * FROM trades WHERE date = ? ORDER BY id ASC", (date,)).fetchall()
-        elif date == 'all':
+
+        if date == 'all':
             rows = conn.execute("SELECT * FROM trades ORDER BY id ASC").fetchall()
+        elif date:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE date = ? ORDER BY id ASC", (date,)
+            ).fetchall()
         else:
-            # Default: today
-            import pytz
-            ist = pytz.timezone('Asia/Kolkata')
+            # Default: most recent date that has trades
+            # (falls back to today for live mode when trades are being written)
+            latest = conn.execute(
+                "SELECT MAX(date) as md FROM trades"
+            ).fetchone()
             today = datetime.now(ist).strftime('%Y-%m-%d')
-            rows = conn.execute("SELECT * FROM trades WHERE date = ? ORDER BY id ASC", (today,)).fetchall()
-        
+            use_date = today  # prefer today when running live
+            if latest and latest['md']:
+                # Use today if it has trades, otherwise fall back to latest with data
+                has_today = conn.execute(
+                    "SELECT COUNT(*) c FROM trades WHERE date = ?", (today,)
+                ).fetchone()
+                if not has_today or has_today['c'] == 0:
+                    use_date = latest['md']
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE date = ? ORDER BY id ASC", (use_date,)
+            ).fetchall()
+
         conn.close()
         return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"API trades error: {e}")
         return []
+
+
+@app.get("/api/summary")
+def api_summary(
+    date: str = Query(None, description="Date YYYY-MM-DD; omit for most recent date with data"),
+):
+    """Daily summary: Day P&L and signal count for a given date.
+
+    Used by the header metrics that change when the user selects a date.
+    Capital and Spot are NOT returned here — they come from /api/state.
+    """
+    try:
+        import pytz
+        ist = pytz.timezone('Asia/Kolkata')
+        conn = get_db()
+
+        # "all" → totals across every trade / signal ever recorded.
+        if date == 'all':
+            row = conn.execute(
+                "SELECT COUNT(*) as trade_count, COALESCE(SUM(pnl_total), 0) as daily_pnl FROM trades"
+            ).fetchone()
+            sig_row = conn.execute(
+                "SELECT COUNT(*) as sc FROM events WHERE kind = 'SIGNAL'"
+            ).fetchone()
+            conn.close()
+            return {
+                "date": "all",
+                "daily_pnl": round(row['daily_pnl'], 2) if row else 0.0,
+                "trade_count": row['trade_count'] if row else 0,
+                "signal_count": sig_row['sc'] if sig_row else 0,
+            }
+
+        if not date:
+            # Default: today if it has trades, else most recent
+            today = datetime.now(ist).strftime('%Y-%m-%d')
+            has_today = conn.execute(
+                "SELECT COUNT(*) c FROM trades WHERE date = ?", (today,)
+            ).fetchone()
+            if has_today and has_today['c'] > 0:
+                date = today
+            else:
+                latest = conn.execute("SELECT MAX(date) as md FROM trades").fetchone()
+                date = latest['md'] if latest and latest['md'] else today
+
+        row = conn.execute(
+            "SELECT COUNT(*) as trade_count, COALESCE(SUM(pnl_total), 0) as daily_pnl "
+            "FROM trades WHERE date = ?",
+            (date,)
+        ).fetchone()
+
+        # Signal count: count SIGNAL events whose timestamp falls on this date.
+        # Since events store UTC timestamps we match by date prefix.
+        sig_row = conn.execute(
+            "SELECT COUNT(*) as sc FROM events WHERE kind = 'SIGNAL' AND date(ts) = ?",
+            (date,)
+        ).fetchone()
+
+        conn.close()
+        return {
+            "date": date,
+            "daily_pnl": round(row['daily_pnl'], 2) if row else 0.0,
+            "trade_count": row['trade_count'] if row else 0,
+            "signal_count": sig_row['sc'] if sig_row else 0,
+        }
+    except Exception as e:
+        logger.error(f"API summary error: {e}")
+        return {"date": date, "daily_pnl": 0.0, "trade_count": 0, "signal_count": 0}
 
 
 @app.get("/api/trades/dates")

@@ -195,21 +195,22 @@ class DashboardDB:
     
     # ---- Events ----
     
-    def insert_event(self, kind, message, data=None):
+    def insert_event(self, kind, message, data=None, ts=None):
         """Insert an activity event.
         
         Args:
             kind: Event type (SIGNAL, SIGNAL_INVALID, SIGNAL_EXPIRED, ENTRY, EXIT, INFO)
             message: Human-readable description
             data: Optional dict with extra info
+            ts: Optional explicit UTC ISO timestamp string. Defaults to now.
         """
         try:
             conn = self._get_conn()
-            now = datetime.utcnow().isoformat() + 'Z'
+            event_ts = ts if ts else (datetime.utcnow().isoformat() + 'Z')
             data_json = json.dumps(data, default=str) if data else None
             conn.execute("""
                 INSERT INTO events (ts, kind, message, data) VALUES (?, ?, ?, ?)
-            """, (now, kind, message, data_json))
+            """, (event_ts, kind, message, data_json))
             conn.commit()
         except Exception as e:
             logger.error(f"DB insert_event error: {e}")
@@ -270,6 +271,40 @@ class DashboardDB:
             logger.error(f"DB get_trade_by_id error: {e}")
             return None
     
+    def get_last_capital(self):
+        """Return capital_after of the most recent trade, or None if no trades.
+
+        Used by the collector to resume the compounding capital across daily
+        restarts (EC2 stop/start) instead of resetting to the ₹20,000 base.
+        """
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT capital_after FROM trades ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row and row['capital_after'] is not None:
+                return float(row['capital_after'])
+            return None
+        except Exception as e:
+            logger.error(f"DB get_last_capital error: {e}")
+            return None
+
+    def get_daily_pnl(self, date):
+        """Return summed pnl_total for a given trading date (YYYY-MM-DD).
+
+        Lets the collector resume today's running P&L if it restarts mid-day.
+        """
+        try:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl_total), 0) AS pnl FROM trades WHERE date = ?",
+                (date,)
+            ).fetchone()
+            return float(row['pnl']) if row else 0.0
+        except Exception as e:
+            logger.error(f"DB get_daily_pnl error: {e}")
+            return 0.0
+
     def get_trade_dates(self):
         """Get list of distinct trade dates."""
         try:

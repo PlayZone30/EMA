@@ -3,41 +3,60 @@
  * ===================================
  * Poll-based architecture (no WebSocket needed).
  * Uses lightweight-charts v4.2.3 (v4 API: addCandlestickSeries).
- * All timestamps shifted to IST via +19800 in one helper.
+ *
+ * Header behaviour:
+ *   Capital  → always from /api/state  (final account balance, never date-filtered)
+ *   Spot     → always from /api/state  (current/last known LTP, never date-filtered)
+ *   Day P&L  → from /api/summary?date= (changes with date selector)
+ *   Signals  → from /api/summary?date= (changes with date selector)
+ *
+ * Default selected date = most recent date with trades
+ * (on a live day that is today, so live mode works identically).
  */
 
 // ============ CONSTANTS ============
 
 const IST_OFFSET = 19800; // +5:30 in seconds
-const POLL_STATE_MS = 2500;
-const POLL_CANDLE_MS = 5000;
-const POLL_EVENTS_MS = 3000;
+const POLL_STATE_MS   = 2500;
+const POLL_CANDLE_MS  = 5000;
+const POLL_EVENTS_MS  = 3000;
+const POLL_SUMMARY_MS = 5000;
 
 // ============ STATE ============
 
-let spotChart = null;
-let spotSeries = null;
-let optionChart = null;
+let spotChart    = null;
+let spotSeries   = null;
+let optionChart  = null;
 let optionSeries = null;
 let optionSlLine = null;
 let optionTpLine = null;
-let activeOptionType = 'ce'; // 'ce' or 'pe'
-let currentState = null;
-let lastEventId = null;
-let syncingCharts = false;
-let modalSpotChart = null;
+let optionEntryLine = null;
+let activeOptionType = 'ce';   // 'ce' or 'pe'
+let currentState     = null;
+let lastEventId      = null;
+let syncingCharts    = false;
+let modalSpotChart   = null;
 let modalOptionChart = null;
+
+// The date currently shown in the trade journal / charts / summary.
+// Kept in sync with the <select> value.
+let selectedDate = '';   // '' means "use server default (most recent)"
+
+// Option symbols (CE/PE) actually traded on the currently-selected date.
+// Used so the option chart shows the right contract when browsing a PAST date,
+// where state.ce_symbol/pe_symbol (the latest day's contracts) would not match.
+let selectedDayOptionSymbols = { ce: null, pe: null };
+
+// Guards the one-time full refresh triggered from loadTradeDates().
+let dateDropdownInitialized = false;
 
 // ============ HELPERS ============
 
 function toIST(utcEpoch) {
-    // lightweight-charts expects UTC epochs; shift for IST display
     return utcEpoch + IST_OFFSET;
 }
 
 function toBarTime(utcEpoch) {
-    // Markers must sit exactly on a bar time: floor intra-candle
-    // timestamps (entry/exit ticks) to their 5-min bucket, then shift
     return toIST(Math.floor(utcEpoch / 300) * 300);
 }
 
@@ -57,9 +76,7 @@ function formatTime(isoStr) {
     try {
         const d = new Date(isoStr);
         return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-    } catch {
-        return isoStr;
-    }
+    } catch { return isoStr; }
 }
 
 function formatEventTime(isoStr) {
@@ -67,9 +84,7 @@ function formatEventTime(isoStr) {
     try {
         const d = new Date(isoStr);
         return d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false });
-    } catch {
-        return '';
-    }
+    } catch { return ''; }
 }
 
 async function fetchJSON(url) {
@@ -83,118 +98,85 @@ async function fetchJSON(url) {
     }
 }
 
-// ============ CHART CREATION (v4 API) ============
+// ============ CHART CREATION ============
 
 function createChart(containerId, height) {
     const container = document.getElementById(containerId);
     if (!container) return { chart: null, series: null };
-    
-    // Clear previous
     container.innerHTML = '';
-    
+
     const chart = LightweightCharts.createChart(container, {
         width: container.clientWidth,
         height: height || container.clientHeight || 300,
         layout: {
             background: { type: 'solid', color: 'transparent' },
-            textColor: '#94a3b8',
-            fontSize: 11,
-            fontFamily: 'Inter, sans-serif',
+            textColor: '#94a3b8', fontSize: 11, fontFamily: 'Inter, sans-serif',
         },
         grid: {
             vertLines: { color: 'rgba(55, 65, 81, 0.3)' },
             horzLines: { color: 'rgba(55, 65, 81, 0.3)' },
         },
-        crosshair: {
-            mode: LightweightCharts.CrosshairMode.Normal,
-        },
-        rightPriceScale: {
-            borderColor: 'rgba(55, 65, 81, 0.5)',
-        },
-        timeScale: {
-            borderColor: 'rgba(55, 65, 81, 0.5)',
-            timeVisible: true,
-            secondsVisible: false,
-        },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        rightPriceScale: { borderColor: 'rgba(55, 65, 81, 0.5)' },
+        timeScale: { borderColor: 'rgba(55, 65, 81, 0.5)', timeVisible: true, secondsVisible: false },
     });
-    
+
     const series = chart.addCandlestickSeries({
-        upColor: '#22c55e',
-        downColor: '#ef4444',
-        borderUpColor: '#22c55e',
-        borderDownColor: '#ef4444',
-        wickUpColor: '#22c55e',
-        wickDownColor: '#ef4444',
+        upColor: '#22c55e', downColor: '#ef4444',
+        borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+        wickUpColor: '#22c55e', wickDownColor: '#ef4444',
     });
-    
-    // Responsive
-    const resizeObserver = new ResizeObserver(entries => {
-        for (const entry of entries) {
-            chart.applyOptions({
-                width: entry.contentRect.width,
-                height: entry.contentRect.height,
-            });
+
+    const ro = new ResizeObserver(entries => {
+        for (const e of entries) {
+            chart.applyOptions({ width: e.contentRect.width, height: e.contentRect.height });
         }
     });
-    resizeObserver.observe(container);
-    
+    ro.observe(container);
+
     return { chart, series };
 }
 
 function addPriceLine(series, price, color, title, lineStyle) {
     if (!series || price == null) return null;
     return series.createPriceLine({
-        price: price,
-        color: color,
-        lineWidth: 1,
+        price, color, lineWidth: 1,
         lineStyle: lineStyle || LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible: true,
-        title: title || '',
+        axisLabelVisible: true, title: title || '',
     });
 }
 
 function setMarkers(series, markers) {
     if (!series) return;
-    try {
-        // Sort markers by time
-        markers.sort((a, b) => a.time - b.time);
-        series.setMarkers(markers);
-    } catch (e) {
-        console.error('setMarkers error:', e);
-    }
+    try { series.setMarkers(markers.sort((a, b) => a.time - b.time)); }
+    catch (e) { console.error('setMarkers error:', e); }
 }
 
 // ============ CHART SYNC ============
 
-function setupChartSync(chart1, chart2) {
-    if (!chart1 || !chart2) return;
-    
-    chart1.timeScale().subscribeVisibleLogicalRangeChange(range => {
-        if (syncingCharts || !range) return;
-        syncingCharts = true;
-        chart2.timeScale().setVisibleLogicalRange(range);
-        syncingCharts = false;
+function setupChartSync(c1, c2) {
+    if (!c1 || !c2) return;
+    c1.timeScale().subscribeVisibleLogicalRangeChange(r => {
+        if (syncingCharts || !r) return;
+        syncingCharts = true; c2.timeScale().setVisibleLogicalRange(r); syncingCharts = false;
     });
-    
-    chart2.timeScale().subscribeVisibleLogicalRangeChange(range => {
-        if (syncingCharts || !range) return;
-        syncingCharts = true;
-        chart1.timeScale().setVisibleLogicalRange(range);
-        syncingCharts = false;
+    c2.timeScale().subscribeVisibleLogicalRangeChange(r => {
+        if (syncingCharts || !r) return;
+        syncingCharts = true; c1.timeScale().setVisibleLogicalRange(r); syncingCharts = false;
     });
 }
 
-// ============ STATE POLLING ============
+// ============ STATE POLLING (Capital + Spot only) ============
 
 async function pollState() {
     const data = await fetchJSON('/api/state');
     if (!data) return;
-    
+
     currentState = data.state;
     const live = data.live;
-    
-    // Live dot
-    const dot = document.getElementById('liveDot');
+
+    // Live indicator
+    const dot   = document.getElementById('liveDot');
     const badge = document.getElementById('staleBadge');
     if (live) {
         dot.classList.remove('stale');
@@ -206,189 +188,185 @@ async function pollState() {
             badge.textContent = `Stale ${Math.round(currentState.heartbeat_age)}s`;
         }
     }
-    
+
     if (!currentState) return;
-    
-    // Header metrics
-    const cap = document.getElementById('capitalValue');
-    cap.textContent = formatPrice(currentState.running_capital);
-    
-    const pnl = document.getElementById('pnlValue');
-    const pnlVal = currentState.daily_pnl || 0;
-    pnl.textContent = formatINR(pnlVal);
-    pnl.className = 'metric-value ' + (pnlVal > 0 ? 'positive' : pnlVal < 0 ? 'negative' : 'neutral');
-    
-    const spot = document.getElementById('spotValue');
-    spot.textContent = currentState.spot_ltp != null ? Number(currentState.spot_ltp).toFixed(2) : '—';
-    
-    document.getElementById('signalsValue').textContent = currentState.daily_signals || 0;
-    
+
+    // ── Capital — always the current account balance, never date-filtered ──
+    document.getElementById('capitalValue').textContent =
+        formatPrice(currentState.running_capital);
+
+    // ── Spot — always the latest known price, never date-filtered ──
+    document.getElementById('spotValue').textContent =
+        currentState.spot_ltp != null ? Number(currentState.spot_ltp).toFixed(2) : '—';
+
+    // Day P&L and Signals are intentionally NOT updated here.
+    // They are driven by loadDaySummary() so they track the selected date.
+
     // Active trade card
     const tradeCard = document.getElementById('activeTradeCard');
     const tradeGrid = document.getElementById('activeTradeGrid');
     const unrealPnl = document.getElementById('tradeUnrealizedPnl');
-    
+
     if (currentState.active_trade) {
         tradeCard.style.display = 'block';
         const t = currentState.active_trade;
-        
-        // Unrealized PnL
         const optLtp = t.type === 'CE_BUY' ? currentState.ce_ltp : currentState.pe_ltp;
+
         if (optLtp != null) {
             const uPnl = (optLtp - t.entry) * 65 * (t.lots || 1);
             unrealPnl.textContent = formatINR(uPnl);
             unrealPnl.className = 'metric-value ' + (uPnl >= 0 ? 'positive' : 'negative');
         }
-        
-        // Time in trade
+
         let timeInTrade = '—';
         if (t.entry_time) {
-            const entryMs = new Date(t.entry_time).getTime();
-            const elapsed = Math.floor((Date.now() - entryMs) / 1000);
-            const mins = Math.floor(elapsed / 60);
-            const secs = elapsed % 60;
-            timeInTrade = `${mins}m ${secs}s`;
+            const elapsed = Math.floor((Date.now() - new Date(t.entry_time).getTime()) / 1000);
+            timeInTrade = `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
         }
-        
+
         tradeGrid.innerHTML = `
-            <div class="trade-field">
-                <span class="trade-field-label">Type</span>
-                <span class="trade-field-value">${t.type || '—'}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Symbol</span>
-                <span class="trade-field-value" style="font-size:0.75rem">${(t.symbol || '—').replace('NSE:', '')}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Entry</span>
-                <span class="trade-field-value">${formatPrice(t.entry)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">SL</span>
-                <span class="trade-field-value" style="color:var(--red)">${formatPrice(t.sl)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">TP</span>
-                <span class="trade-field-value" style="color:var(--green)">${formatPrice(t.tp)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Lots</span>
-                <span class="trade-field-value">${t.lots || '—'}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">LTP</span>
-                <span class="trade-field-value">${formatPrice(optLtp)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Time</span>
-                <span class="trade-field-value">${timeInTrade}</span>
-            </div>
-        `;
+            <div class="trade-field"><span class="trade-field-label">Type</span><span class="trade-field-value">${t.type || '—'}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Symbol</span><span class="trade-field-value" style="font-size:0.75rem">${(t.symbol || '—').replace('NSE:', '')}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Entry</span><span class="trade-field-value">${formatPrice(t.entry)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">SL</span><span class="trade-field-value" style="color:var(--red)">${formatPrice(t.sl)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">TP</span><span class="trade-field-value" style="color:var(--green)">${formatPrice(t.tp)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Lots</span><span class="trade-field-value">${t.lots || '—'}</span></div>
+            <div class="trade-field"><span class="trade-field-label">LTP</span><span class="trade-field-value">${formatPrice(optLtp)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Time</span><span class="trade-field-value">${timeInTrade}</span></div>`;
     } else {
         tradeCard.style.display = 'none';
     }
-    
+
     // Pending signals
     const chips = document.getElementById('signalChips');
     if (currentState.pending_signals && currentState.pending_signals.length > 0) {
         chips.innerHTML = currentState.pending_signals.map(sig => {
-            const expires = sig.expires_at ? new Date(sig.expires_at * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false }) : '?';
-            return `<span class="signal-chip">
-                <span class="dot"></span>
-                ${sig.type} armed, trigger &gt; ${Number(sig.high).toFixed(2)}, expires ${expires}
-            </span>`;
+            const expires = sig.expires_at
+                ? new Date(sig.expires_at * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: false })
+                : '?';
+            return `<span class="signal-chip"><span class="dot"></span>${sig.type} armed, trigger &gt; ${Number(sig.high).toFixed(2)}, expires ${expires}</span>`;
         }).join('');
     } else {
         chips.innerHTML = '<span class="no-signals">No active signals</span>';
     }
-    
-    // Update option chart title
+
+    // Option chart title
     if (currentState.active_trade) {
-        const sym = currentState.active_trade.symbol || '';
-        document.getElementById('optionChartTitle').textContent = sym.replace('NSE:', '');
+        document.getElementById('optionChartTitle').textContent =
+            (currentState.active_trade.symbol || '').replace('NSE:', '');
     } else {
-        const sym = activeOptionType === 'ce' ? (currentState.ce_symbol || 'CE') : (currentState.pe_symbol || 'PE');
+        const sym = activeOptionType === 'ce'
+            ? (currentState.ce_symbol || 'CE')
+            : (currentState.pe_symbol || 'PE');
         document.getElementById('optionChartTitle').textContent = sym.replace('NSE:', '');
     }
+}
+
+// ============ DAY SUMMARY (Day P&L + Signals — date-aware) ============
+
+async function loadDaySummary(date) {
+    const url = date ? `/api/summary?date=${date}` : '/api/summary';
+    const data = await fetchJSON(url);
+    if (!data) return;
+
+    const pnlEl = document.getElementById('pnlValue');
+    const pnlVal = data.daily_pnl || 0;
+    pnlEl.textContent = formatINR(pnlVal);
+    pnlEl.className = 'metric-value ' + (pnlVal > 0 ? 'positive' : pnlVal < 0 ? 'negative' : 'neutral');
+
+    document.getElementById('signalsValue').textContent = data.signal_count || 0;
 }
 
 // ============ CANDLE POLLING ============
 
 async function pollCandles() {
     if (!currentState) return;
-    
+
+    const dateParam = selectedDate ? `&date=${selectedDate}` : '';
+
     // Spot candles
-    const spotData = await fetchJSON(`/api/candles?symbol=${encodeURIComponent('NSE:NIFTY50-INDEX')}`);
+    const spotData = await fetchJSON(
+        `/api/candles?symbol=${encodeURIComponent('NSE:NIFTY50-INDEX')}${dateParam}`
+    );
     if (spotData && spotSeries) {
-        const bars = spotData.map(c => ({
-            time: toIST(c.time),
-            open: c.open, high: c.high, low: c.low, close: c.close,
-        }));
-        spotSeries.setData(bars);
+        spotSeries.setData(spotData.map(c => ({
+            time: toIST(c.time), open: c.open, high: c.high, low: c.low, close: c.close,
+        })));
     }
-    
-    // Option candles — use active trade symbol or selected toggle
+
+    // Option candles — active trade symbol takes priority over toggle.
+    // When browsing a specific past date, use that date's traded contracts
+    // (state.ce_symbol/pe_symbol are the latest day's, which won't have
+    // candles on an older date).
     let optSymbol;
     if (currentState.active_trade) {
         optSymbol = currentState.active_trade.symbol;
+    } else if (selectedDate && selectedDate !== 'all' &&
+               (selectedDayOptionSymbols.ce || selectedDayOptionSymbols.pe)) {
+        optSymbol = activeOptionType === 'ce'
+            ? selectedDayOptionSymbols.ce
+            : selectedDayOptionSymbols.pe;
     } else {
-        optSymbol = activeOptionType === 'ce' ? currentState.ce_symbol : currentState.pe_symbol;
+        optSymbol = activeOptionType === 'ce'
+            ? currentState.ce_symbol
+            : currentState.pe_symbol;
     }
-    
+
     if (optSymbol) {
-        const optData = await fetchJSON(`/api/candles?symbol=${encodeURIComponent(optSymbol)}`);
+        const optData = await fetchJSON(
+            `/api/candles?symbol=${encodeURIComponent(optSymbol)}${dateParam}`
+        );
         if (optData && optionSeries) {
-            const bars = optData.map(c => ({
-                time: toIST(c.time),
-                open: c.open, high: c.high, low: c.low, close: c.close,
-            }));
-            optionSeries.setData(bars);
-            
-            // SL/TP lines for active trade
+            optionSeries.setData(optData.map(c => ({
+                time: toIST(c.time), open: c.open, high: c.high, low: c.low, close: c.close,
+            })));
+
+            // Remove old SL/TP/Entry lines
             if (optionSlLine) { try { optionSeries.removePriceLine(optionSlLine); } catch {} }
             if (optionTpLine) { try { optionSeries.removePriceLine(optionTpLine); } catch {} }
-            optionSlLine = null;
-            optionTpLine = null;
-            
+            if (optionEntryLine) { try { optionSeries.removePriceLine(optionEntryLine); } catch {} }
+            optionSlLine = null; optionTpLine = null; optionEntryLine = null;
+
             if (currentState.active_trade && currentState.active_trade.symbol === optSymbol) {
                 optionSlLine = addPriceLine(optionSeries, currentState.active_trade.sl, '#ef4444', 'SL');
                 optionTpLine = addPriceLine(optionSeries, currentState.active_trade.tp, '#22c55e', 'TP');
+                optionEntryLine = addPriceLine(optionSeries, currentState.active_trade.entry, '#3b82f6', 'ENTRY',
+                    LightweightCharts.LineStyle.Solid);
             }
-            
-            // Entry/exit markers from today's trades
+
             await addTradeMarkers(optSymbol, optionSeries);
         }
+    } else if (optionSeries) {
+        // No contract for this date/toggle — clear the option chart.
+        optionSeries.setData([]);
+        if (optionSlLine) { try { optionSeries.removePriceLine(optionSlLine); } catch {} optionSlLine = null; }
+        if (optionTpLine) { try { optionSeries.removePriceLine(optionTpLine); } catch {} optionTpLine = null; }
+        if (optionEntryLine) { try { optionSeries.removePriceLine(optionEntryLine); } catch {} optionEntryLine = null; }
+        try { optionSeries.setMarkers([]); } catch {}
     }
 }
 
 async function addTradeMarkers(symbol, series) {
-    const trades = await fetchJSON('/api/trades');
+    const dateParam = selectedDate ? `?date=${selectedDate}` : '';
+    const trades = await fetchJSON(`/api/trades${dateParam}`);
     if (!trades || !series) return;
-    
+
     const markers = [];
     for (const t of trades) {
         if (t.symbol !== symbol) continue;
-        
-        // Entry marker
         if (t.entry_time) {
             try {
-                const entryTs = toBarTime(new Date(t.entry_time).getTime() / 1000);
                 markers.push({
-                    time: entryTs,
-                    position: 'belowBar',
-                    color: '#22c55e',
-                    shape: 'arrowUp',
+                    time: toBarTime(new Date(t.entry_time).getTime() / 1000),
+                    position: 'belowBar', color: '#22c55e', shape: 'arrowUp',
                     text: `ENTRY ${Number(t.entry_price).toFixed(1)}`,
                 });
             } catch {}
         }
-        
-        // Exit marker
         if (t.exit_time) {
             try {
-                const exitTs = toBarTime(new Date(t.exit_time).getTime() / 1000);
                 markers.push({
-                    time: exitTs,
+                    time: toBarTime(new Date(t.exit_time).getTime() / 1000),
                     position: 'aboveBar',
                     color: t.exit_reason === 'TP' ? '#22c55e' : '#ef4444',
                     shape: 'arrowDown',
@@ -397,42 +375,44 @@ async function addTradeMarkers(symbol, series) {
             } catch {}
         }
     }
-    
     setMarkers(series, markers);
 }
 
 // ============ TRADE LOG ============
 
 async function loadTrades() {
-    const dateFilter = document.getElementById('dateFilter');
-    const dateVal = dateFilter.value;
-    
-    let url = '/api/trades';
-    if (dateVal) url += `?date=${dateVal}`;
-    
+    const dateVal = document.getElementById('dateFilter').value;
+    selectedDate = dateVal;   // keep module-level state in sync
+
+    const url = dateVal ? `/api/trades?date=${dateVal}` : '/api/trades';
     const trades = await fetchJSON(url);
     const list = document.getElementById('tradeList');
-    
+
     if (!trades || trades.length === 0) {
+        selectedDayOptionSymbols = { ce: null, pe: null };
         list.innerHTML = '<div class="no-trades">No trades yet</div>';
         return;
     }
-    
+
+    // Capture the CE/PE contracts traded on this date so the option chart can
+    // render them when browsing history (most recent trade of each type wins).
+    const ceSyms = { ce: null, pe: null };
+    for (const t of trades) {
+        const isCe = (t.type || '').toUpperCase().includes('CE');
+        if (isCe) ceSyms.ce = t.symbol;
+        else ceSyms.pe = t.symbol;
+    }
+    selectedDayOptionSymbols = ceSyms;
+
     list.innerHTML = trades.map(t => {
-        const entryTime = formatTime(t.entry_time);
-        const exitTime = formatTime(t.exit_time);
         const pnl = t.pnl_total || 0;
-        const pnlClass = pnl >= 0 ? 'positive' : 'negative';
-        const typeClass = (t.type || '').toLowerCase().includes('ce') ? 'ce' : 'pe';
-        const exitClass = t.exit_reason === 'TP' ? 'exit-tp' : t.exit_reason === 'SL' ? 'exit-sl' : 'exit-eod';
-        
         return `<div class="trade-row" onclick="openTradeModal(${t.id})">
             <span class="trade-id">#${t.id}</span>
-            <span class="trade-type ${typeClass}">${t.type || '—'}</span>
-            <span class="trade-time">${entryTime}→${exitTime}</span>
+            <span class="trade-type ${(t.type||'').toLowerCase().includes('ce') ? 'ce' : 'pe'}">${t.type || '—'}</span>
+            <span class="trade-time">${formatTime(t.entry_time)}→${formatTime(t.exit_time)}</span>
             <span class="trade-prices">${formatPrice(t.entry_price)}→${formatPrice(t.exit_price)}</span>
-            <span class="trade-pnl metric-value ${pnlClass}">${formatINR(pnl)}</span>
-            <span class="trade-exit-reason ${exitClass}">${t.exit_reason || '—'}</span>
+            <span class="trade-pnl metric-value ${pnl >= 0 ? 'positive' : 'negative'}">${formatINR(pnl)}</span>
+            <span class="trade-exit-reason ${t.exit_reason === 'TP' ? 'exit-tp' : t.exit_reason === 'SL' ? 'exit-sl' : 'exit-eod'}">${t.exit_reason || '—'}</span>
         </div>`;
     }).join('');
 }
@@ -440,14 +420,42 @@ async function loadTrades() {
 async function loadTradeDates() {
     const dates = await fetchJSON('/api/trades/dates');
     const select = document.getElementById('dateFilter');
-    
-    // Keep the "Today" option
+
+    // Preserve whatever the user currently has selected so the periodic refresh
+    // (every 30s) doesn't clobber their chosen date.
+    const prev = select.value;
+
     select.innerHTML = '<option value="">Today</option>';
     if (dates && dates.length > 0) {
         select.innerHTML += '<option value="all">All</option>';
         dates.forEach(d => {
             select.innerHTML += `<option value="${d}">${d}</option>`;
         });
+
+        const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD local
+
+        // Restore prior selection if it still exists in the list.
+        if (prev && (prev === 'all' || prev === '' || dates.includes(prev))) {
+            select.value = prev;
+            selectedDate = prev;
+        } else if (!dates.includes(today)) {
+            // First load with no live data for today → default to most recent.
+            select.value = dates[0]; // dates are DESC, so [0] is most recent
+            selectedDate = dates[0];
+        }
+    } else if (prev) {
+        // No dates returned but keep prior selection value if any.
+        select.value = prev === 'all' ? '' : prev;
+    }
+
+    // Only do a full date-dependent refresh on the FIRST load. On the periodic
+    // 30s refresh the selection is unchanged, so we skip the reload to avoid
+    // fighting the user / re-fetching needlessly.
+    if (!dateDropdownInitialized) {
+        dateDropdownInitialized = true;
+        await loadTrades();
+        await loadDaySummary(selectedDate);
+        await pollCandles();
     }
 }
 
@@ -456,66 +464,29 @@ async function loadTradeDates() {
 async function openTradeModal(tradeId) {
     const data = await fetchJSON(`/api/trades/${tradeId}`);
     if (!data || !data.trade) return;
-    
+
     const t = data.trade;
-    const modal = document.getElementById('tradeModal');
-    const body = document.getElementById('modalBody');
-    const title = document.getElementById('modalTitle');
-    
-    const pnl = t.pnl_total || 0;
+    const modal  = document.getElementById('tradeModal');
+    const body   = document.getElementById('modalBody');
+    const title  = document.getElementById('modalTitle');
+    const pnl    = t.pnl_total || 0;
     const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+
     title.textContent = `Trade #${t.id} — ${t.type} on ${(t.symbol || '').replace('NSE:', '')}`;
-    
     body.innerHTML = `
         <div class="modal-metrics">
-            <div class="trade-field">
-                <span class="trade-field-label">Entry</span>
-                <span class="trade-field-value">${formatPrice(t.entry_price)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Exit</span>
-                <span class="trade-field-value">${formatPrice(t.exit_price)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">SL</span>
-                <span class="trade-field-value" style="color:var(--red)">${formatPrice(t.sl)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">TP</span>
-                <span class="trade-field-value" style="color:var(--green)">${formatPrice(t.tp)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Risk</span>
-                <span class="trade-field-value">${formatPrice(t.risk)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Lots</span>
-                <span class="trade-field-value">${t.lots}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">P&L</span>
-                <span class="trade-field-value ${pnlClass}">${formatINR(pnl)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Exit Reason</span>
-                <span class="trade-field-value">${t.exit_reason}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Highest</span>
-                <span class="trade-field-value">${formatPrice(t.highest_reached)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Signal</span>
-                <span class="trade-field-value" style="font-size:0.8rem">${t.signal_reason || '—'}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Entry Time</span>
-                <span class="trade-field-value">${formatTime(t.entry_time)}</span>
-            </div>
-            <div class="trade-field">
-                <span class="trade-field-label">Exit Time</span>
-                <span class="trade-field-value">${formatTime(t.exit_time)}</span>
-            </div>
+            <div class="trade-field"><span class="trade-field-label">Entry</span><span class="trade-field-value">${formatPrice(t.entry_price)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Exit</span><span class="trade-field-value">${formatPrice(t.exit_price)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">SL</span><span class="trade-field-value" style="color:var(--red)">${formatPrice(t.sl)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">TP</span><span class="trade-field-value" style="color:var(--green)">${formatPrice(t.tp)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Risk</span><span class="trade-field-value">${formatPrice(t.risk)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Lots</span><span class="trade-field-value">${t.lots}</span></div>
+            <div class="trade-field"><span class="trade-field-label">P&L</span><span class="trade-field-value ${pnlClass}">${formatINR(pnl)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Exit Reason</span><span class="trade-field-value">${t.exit_reason}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Highest</span><span class="trade-field-value">${formatPrice(t.highest_reached)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Signal</span><span class="trade-field-value" style="font-size:0.8rem">${t.signal_reason || '—'}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Entry Time</span><span class="trade-field-value">${formatTime(t.entry_time)}</span></div>
+            <div class="trade-field"><span class="trade-field-label">Exit Time</span><span class="trade-field-value">${formatTime(t.exit_time)}</span></div>
         </div>
         <div class="modal-charts">
             <div class="modal-chart-box">
@@ -526,109 +497,63 @@ async function openTradeModal(tradeId) {
                 <div class="modal-chart-label">${(t.symbol || '').replace('NSE:', '')}</div>
                 <div id="modalOptionChart" style="width:100%;height:calc(100% - 24px)"></div>
             </div>
-        </div>
-    `;
-    
+        </div>`;
+
     modal.classList.add('active');
-    
-    // Create modal charts
+
     setTimeout(() => {
-        const spotContainer = document.getElementById('modalSpotChart');
-        const optContainer = document.getElementById('modalOptionChart');
-        
-        if (spotContainer) {
+        // Spot modal chart
+        const spotCont = document.getElementById('modalSpotChart');
+        if (spotCont) {
             if (modalSpotChart) { modalSpotChart.remove(); modalSpotChart = null; }
-            modalSpotChart = LightweightCharts.createChart(spotContainer, {
-                width: spotContainer.clientWidth,
-                height: spotContainer.clientHeight || 240,
+            modalSpotChart = LightweightCharts.createChart(spotCont, {
+                width: spotCont.clientWidth, height: spotCont.clientHeight || 240,
                 layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#94a3b8', fontSize: 10, fontFamily: 'Inter' },
                 grid: { vertLines: { color: 'rgba(55,65,81,0.3)' }, horzLines: { color: 'rgba(55,65,81,0.3)' } },
                 timeScale: { timeVisible: true, borderColor: 'rgba(55,65,81,0.5)' },
                 rightPriceScale: { borderColor: 'rgba(55,65,81,0.5)' },
             });
-            const mSpotSeries = modalSpotChart.addCandlestickSeries({
-                upColor: '#22c55e', downColor: '#ef4444',
-                borderUpColor: '#22c55e', borderDownColor: '#ef4444',
-                wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+            const mSpot = modalSpotChart.addCandlestickSeries({
+                upColor:'#22c55e',downColor:'#ef4444',borderUpColor:'#22c55e',borderDownColor:'#ef4444',wickUpColor:'#22c55e',wickDownColor:'#ef4444',
             });
-            
             if (data.spot_candles) {
-                mSpotSeries.setData(data.spot_candles.map(c => ({
-                    time: toIST(c.time), open: c.open, high: c.high, low: c.low, close: c.close,
-                })));
+                mSpot.setData(data.spot_candles.map(c => ({ time: toIST(c.time), open:c.open, high:c.high, low:c.low, close:c.close })));
             }
-            
-            // Signal candle marker
             if (t.signal_time) {
                 try {
-                    const sigTs = toBarTime(new Date(t.signal_time).getTime() / 1000);
-                    mSpotSeries.setMarkers([{
-                        time: sigTs, position: 'belowBar', color: '#f59e0b', shape: 'circle', text: 'SIG',
-                    }]);
+                    mSpot.setMarkers([{ time: toBarTime(new Date(t.signal_time).getTime()/1000), position:'belowBar', color:'#f59e0b', shape:'circle', text:'SIG' }]);
                 } catch {}
             }
-            
             modalSpotChart.timeScale().fitContent();
         }
-        
-        if (optContainer) {
+
+        // Option modal chart
+        const optCont = document.getElementById('modalOptionChart');
+        if (optCont) {
             if (modalOptionChart) { modalOptionChart.remove(); modalOptionChart = null; }
-            modalOptionChart = LightweightCharts.createChart(optContainer, {
-                width: optContainer.clientWidth,
-                height: optContainer.clientHeight || 240,
+            modalOptionChart = LightweightCharts.createChart(optCont, {
+                width: optCont.clientWidth, height: optCont.clientHeight || 240,
                 layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#94a3b8', fontSize: 10, fontFamily: 'Inter' },
                 grid: { vertLines: { color: 'rgba(55,65,81,0.3)' }, horzLines: { color: 'rgba(55,65,81,0.3)' } },
                 timeScale: { timeVisible: true, borderColor: 'rgba(55,65,81,0.5)' },
                 rightPriceScale: { borderColor: 'rgba(55,65,81,0.5)' },
             });
-            const mOptSeries = modalOptionChart.addCandlestickSeries({
-                upColor: '#22c55e', downColor: '#ef4444',
-                borderUpColor: '#22c55e', borderDownColor: '#ef4444',
-                wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+            const mOpt = modalOptionChart.addCandlestickSeries({
+                upColor:'#22c55e',downColor:'#ef4444',borderUpColor:'#22c55e',borderDownColor:'#ef4444',wickUpColor:'#22c55e',wickDownColor:'#ef4444',
             });
-            
             if (data.option_candles) {
-                mOptSeries.setData(data.option_candles.map(c => ({
-                    time: toIST(c.time), open: c.open, high: c.high, low: c.low, close: c.close,
-                })));
+                mOpt.setData(data.option_candles.map(c => ({ time: toIST(c.time), open:c.open, high:c.high, low:c.low, close:c.close })));
             }
-            
-            // SL/TP lines
-            addPriceLine(mOptSeries, t.sl, '#ef4444', 'SL');
-            addPriceLine(mOptSeries, t.tp, '#22c55e', 'TP');
-            
-            // Entry/exit markers
+            addPriceLine(mOpt, t.sl, '#ef4444', 'SL');
+            addPriceLine(mOpt, t.tp, '#22c55e', 'TP');
+            addPriceLine(mOpt, t.entry_price, '#3b82f6', 'ENTRY', LightweightCharts.LineStyle.Solid);
+
             const markers = [];
-            if (t.entry_time) {
-                try {
-                    markers.push({
-                        time: toBarTime(new Date(t.entry_time).getTime() / 1000),
-                        position: 'belowBar', color: '#22c55e', shape: 'arrowUp',
-                        text: `ENTRY ${Number(t.entry_price).toFixed(1)}`,
-                    });
-                } catch {}
-            }
-            if (t.exit_time) {
-                try {
-                    markers.push({
-                        time: toBarTime(new Date(t.exit_time).getTime() / 1000),
-                        position: 'aboveBar',
-                        color: t.exit_reason === 'TP' ? '#22c55e' : '#ef4444',
-                        shape: 'arrowDown',
-                        text: `${t.exit_reason} ${Number(t.exit_price).toFixed(1)}`,
-                    });
-                } catch {}
-            }
-            if (t.signal_time) {
-                try {
-                    markers.push({
-                        time: toBarTime(new Date(t.signal_time).getTime() / 1000),
-                        position: 'belowBar', color: '#f59e0b', shape: 'circle', text: 'SIG',
-                    });
-                } catch {}
-            }
-            setMarkers(mOptSeries, markers);
-            
+            if (t.entry_time) { try { markers.push({ time: toBarTime(new Date(t.entry_time).getTime()/1000), position:'belowBar', color:'#22c55e', shape:'arrowUp', text:`ENTRY ${Number(t.entry_price).toFixed(1)}` }); } catch {} }
+            if (t.exit_time)  { try { markers.push({ time: toBarTime(new Date(t.exit_time).getTime()/1000),  position:'aboveBar', color: t.exit_reason==='TP'?'#22c55e':'#ef4444', shape:'arrowDown', text:`${t.exit_reason} ${Number(t.exit_price).toFixed(1)}` }); } catch {} }
+            if (t.signal_time){ try { markers.push({ time: toBarTime(new Date(t.signal_time).getTime()/1000), position:'belowBar', color:'#f59e0b', shape:'circle', text:'SIG' }); } catch {} }
+            setMarkers(mOpt, markers);
+
             modalOptionChart.timeScale().fitContent();
         }
     }, 100);
@@ -636,7 +561,7 @@ async function openTradeModal(tradeId) {
 
 function closeTradeModal() {
     document.getElementById('tradeModal').classList.remove('active');
-    if (modalSpotChart) { modalSpotChart.remove(); modalSpotChart = null; }
+    if (modalSpotChart)   { modalSpotChart.remove();   modalSpotChart = null; }
     if (modalOptionChart) { modalOptionChart.remove(); modalOptionChart = null; }
 }
 
@@ -644,66 +569,54 @@ function closeTradeModal() {
 
 async function pollEvents() {
     let url = '/api/events?limit=50';
-    if (lastEventId != null) {
-        url += `&after_id=${lastEventId}`;
-    }
-    
+    if (lastEventId != null) url += `&after_id=${lastEventId}`;
+
     const events = await fetchJSON(url);
     if (!events || events.length === 0) return;
-    
-    // Track highest event ID
+
     const maxId = Math.max(...events.map(e => e.id));
-    if (lastEventId == null || maxId > lastEventId) {
-        lastEventId = maxId;
-    }
-    
+    if (lastEventId == null || maxId > lastEventId) lastEventId = maxId;
+
     const feed = document.getElementById('eventFeed');
-    
-    // If first load, replace placeholder
-    if (feed.querySelector('.no-events')) {
-        feed.innerHTML = '';
-    }
-    
-    // Prepend new events (they come in DESC order, but we want newest first)
+    if (feed.querySelector('.no-events')) feed.innerHTML = '';
+
     const newHtml = events.map(e => {
         const kindClass = (e.kind || '').toLowerCase().replace(' ', '_');
-        const dataStr = e.data ? ` — ${e.data}` : '';
         return `<div class="event-row">
             <span class="event-time">${formatEventTime(e.ts)}</span>
             <span class="event-kind ${kindClass}">${e.kind}</span>
             <span class="event-message">${e.message || ''}</span>
         </div>`;
     }).join('');
-    
-    // For first load, just set innerHTML; for incremental, prepend
+
     if (feed.children.length === 0) {
         feed.innerHTML = newHtml;
     } else {
-        // Only prepend truly new events
         feed.insertAdjacentHTML('afterbegin', newHtml);
-        
-        // Keep max 100 rows
-        while (feed.children.length > 100) {
-            feed.removeChild(feed.lastChild);
-        }
+        while (feed.children.length > 100) feed.removeChild(feed.lastChild);
     }
+}
+
+// ============ DATE FILTER CHANGE ============
+
+async function onDateChange() {
+    const dateVal = document.getElementById('dateFilter').value;
+    selectedDate = dateVal;
+    // Load trades first so selectedDayOptionSymbols is populated before the
+    // option chart is redrawn for the newly selected date.
+    await loadTrades();
+    loadDaySummary(selectedDate);
+    pollCandles();
 }
 
 // ============ INIT ============
 
 document.addEventListener('DOMContentLoaded', () => {
     // Create main charts
-    const spotResult = createChart('spotChartContainer');
-    spotChart = spotResult.chart;
-    spotSeries = spotResult.series;
-    
-    const optResult = createChart('optionChartContainer');
-    optionChart = optResult.chart;
-    optionSeries = optResult.series;
-    
-    // Sync charts
+    ({ chart: spotChart, series: spotSeries } = createChart('spotChartContainer'));
+    ({ chart: optionChart, series: optionSeries } = createChart('optionChartContainer'));
     setupChartSync(spotChart, optionChart);
-    
+
     // CE/PE toggle
     document.getElementById('btnCE').addEventListener('click', () => {
         activeOptionType = 'ce';
@@ -717,32 +630,31 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('btnCE').classList.remove('active');
         pollCandles();
     });
-    
-    // Date filter
-    document.getElementById('dateFilter').addEventListener('change', loadTrades);
-    
+
+    // Date filter — single handler
+    document.getElementById('dateFilter').addEventListener('change', onDateChange);
+
     // Modal close
     document.getElementById('modalClose').addEventListener('click', closeTradeModal);
-    document.getElementById('tradeModal').addEventListener('click', (e) => {
+    document.getElementById('tradeModal').addEventListener('click', e => {
         if (e.target === e.currentTarget) closeTradeModal();
     });
-    
-    // Keyboard close
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') closeTradeModal();
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTradeModal(); });
+
+    // Initial load order:
+    // 1. State (gives Capital + Spot immediately)
+    // 2. Trade dates → sets dropdown → triggers loadTrades + loadDaySummary + pollCandles
+    // 3. Events
+    pollState().then(() => {
+        loadTradeDates();   // async: sets dropdown, then loads everything date-dependent
+        pollEvents();
     });
-    
-    // Initial loads
-    pollState();
-    pollCandles();
-    loadTrades();
-    loadTradeDates();
-    pollEvents();
-    
+
     // Polling intervals
-    setInterval(pollState, POLL_STATE_MS);
-    setInterval(pollCandles, POLL_CANDLE_MS);
-    setInterval(pollEvents, POLL_EVENTS_MS);
-    setInterval(loadTrades, 10000);
-    setInterval(loadTradeDates, 30000);
+    setInterval(pollState,        POLL_STATE_MS);
+    setInterval(pollCandles,      POLL_CANDLE_MS);
+    setInterval(pollEvents,       POLL_EVENTS_MS);
+    setInterval(() => loadDaySummary(selectedDate), POLL_SUMMARY_MS);
+    setInterval(loadTrades,       10000);
+    setInterval(loadTradeDates,   30000);
 });

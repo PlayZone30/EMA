@@ -249,9 +249,33 @@ class Live5MinEngine:
             from dashboard_db import DashboardDB
             self.db = DashboardDB()
             logger.info("📊 Dashboard DB initialized")
+            self._resume_from_db()
         except Exception as e:
             logger.warning(f"Dashboard DB not available (non-fatal): {e}")
             self.db = None
+
+    def _resume_from_db(self):
+        """Resume compounding capital (and today's P&L) from the DB.
+
+        EC2 stops daily and the EBS volume persists live_dashboard.db, so on the
+        next start we carry the running capital forward instead of resetting to
+        the ₹20,000 base. If the process restarts mid-day, today's realized P&L
+        is also restored so the dashboard header stays consistent.
+        """
+        try:
+            last_cap = self.db.get_last_capital()
+            if last_cap is not None and last_cap > 0:
+                self.running_capital = last_cap
+                logger.info(f"💰 Resumed running capital from DB: ₹{last_cap:.2f}")
+            else:
+                logger.info(f"💰 No prior capital in DB — starting at ₹{CAPITAL:.2f}")
+
+            today = datetime.now(IST).strftime('%Y-%m-%d')
+            self.daily_pnl = self.db.get_daily_pnl(today)
+            if self.daily_pnl:
+                logger.info(f"📈 Resumed today's P&L from DB: ₹{self.daily_pnl:+.2f}")
+        except Exception as e:
+            logger.warning(f"Could not resume from DB (non-fatal): {e}")
 
     def _db_log_event(self, kind, message, data=None):
         """Log an event to the dashboard DB. Never raises."""
@@ -405,11 +429,15 @@ class Live5MinEngine:
                 logger.error(f"Refresh error: {e}")
 
     def _store_candle(self, symbol, candle):
-        if symbol not in self.candle_history:
-            self.candle_history[symbol] = []
-        self.candle_history[symbol].append(candle)
-        # NOT POPPING - keep all candles for accurate avg candle size computation!
-        
+        # A4-race fix: guard candle_history (refresh worker may replace the dict
+        # under _symbol_lock concurrently). Same-thread as _on_message, but the
+        # lock here is released before check_divergence runs (no nesting).
+        with self._symbol_lock:
+            if symbol not in self.candle_history:
+                self.candle_history[symbol] = []
+            self.candle_history[symbol].append(candle)
+            # NOT POPPING - keep all candles for accurate avg candle size computation!
+
         # DB: write final candle
         self._db_write_candle(symbol, candle, is_final=True)
 
@@ -421,14 +449,19 @@ class Live5MinEngine:
         Evaluates each pair only when both latest candles share the same bucket.
         Deduplicates via self.last_signal_bucket.
         """
-        spot_candles = self.candle_history.get(SPOT_SYMBOL, [])
+        # Snapshot candle_history references under the lock (refresh worker may
+        # replace the dict concurrently).
+        with self._symbol_lock:
+            spot_candles = list(self.candle_history.get(SPOT_SYMBOL, []))
+            pe_candles = list(self.candle_history.get(self.pe_symbol, [])) if self.pe_symbol else []
+            ce_candles = list(self.candle_history.get(self.ce_symbol, [])) if self.ce_symbol else []
+
         if not spot_candles:
             return
         spot_candle = spot_candles[-1]
 
         # Check PE divergence (Spot GREEN + PE GREEN)
         if self.pe_symbol:
-            pe_candles = self.candle_history.get(self.pe_symbol, [])
             if pe_candles and pe_candles[-1]['time'] == spot_candle['time']:
                 pe_c = pe_candles[-1]
                 # A1: Dedupe — skip if signal already raised for this (pe_symbol, bucket)
@@ -438,7 +471,12 @@ class Live5MinEngine:
                         self.daily_signals += 1
                         self.last_signal_bucket[bucket_key] = True
                         rsn = f"Spot GREEN + PE GREEN"
-                        # A2: expires_at = signal_candle_time + 600 (two 5-min buckets)
+                        # A2: Entry is only valid during the candle IMMEDIATELY
+                        # after the signal candle. The signal candle's bucket
+                        # starts at T and ends at T+300; the next (entry) candle
+                        # spans [T+300, T+600). pe_c['time'] is the bucket START
+                        # (T), so expires_at = T+600 = end of that next candle.
+                        # => one 5-min bucket to break the high, else it expires.
                         self.pending_signals[self.pe_symbol] = {
                             'type': 'PE_BUY', 'high': pe_c['high'], 'low': pe_c['low'],
                             'candle': pe_c, 'reason': rsn,
@@ -452,7 +490,6 @@ class Live5MinEngine:
 
         # Check CE divergence (Spot RED + CE GREEN)
         if self.ce_symbol:
-            ce_candles = self.candle_history.get(self.ce_symbol, [])
             if ce_candles and ce_candles[-1]['time'] == spot_candle['time']:
                 ce_c = ce_candles[-1]
                 # A1: Dedupe
@@ -462,7 +499,8 @@ class Live5MinEngine:
                         self.daily_signals += 1
                         self.last_signal_bucket[bucket_key] = True
                         rsn = f"Spot RED + CE GREEN"
-                        # A2: expires_at
+                        # A2: same as PE above — entry valid only during the
+                        # immediately-next 5-min candle ([T+300, T+600)).
                         self.pending_signals[self.ce_symbol] = {
                             'type': 'CE_BUY', 'high': ce_c['high'], 'low': ce_c['low'],
                             'candle': ce_c, 'reason': rsn,
@@ -545,15 +583,17 @@ class Live5MinEngine:
 
     def _enter_trade(self, symbol, ltp, ts, sig):
         cost_per_lot = ltp * LOT_SIZE
-        lots = int(self.running_capital // cost_per_lot)
-        
-        if lots <= 0:
+        # Fixed 1 lot (65 units) per trade — matches backtest_2024_daywise.py
+        # and seed_dashboard_db.py (no dynamic/compounding position sizing).
+        lots = 1
+
+        if self.running_capital < cost_per_lot:
             logger.warning(f"  ⚠️ Insufficient capital: Need ₹{cost_per_lot:.2f}, have ₹{self.running_capital:.2f}")
             return
             
-        hist = self.candle_history.get(symbol, [])
+        with self._symbol_lock:
+            hist = list(self.candle_history.get(symbol, []))
         avg_sz = sum(c['high'] - c['low'] for c in hist) / len(hist) if hist else 0.0
-
         self.active_trade = ActiveTrade5Min(symbol, sig['type'], ltp, ts, sig['candle'], sig['reason'], avg_sz, lots)
         
         print()

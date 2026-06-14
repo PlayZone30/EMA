@@ -1,7 +1,7 @@
 .env
 __pycache__/
 /analysis_output
-# /data_5min
+/data_5min
 /2024
 /2024_daywise_spot
 /2024_daywise
@@ -13,7 +13,7 @@ __pycache__/
 
 
 # Live deploy runtime artifacts
-# live_deploy/*.db
+live_deploy/*.db
 live_deploy/*.db-wal
 live_deploy/*.db-shm
 live_deploy/*.log
