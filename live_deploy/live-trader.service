@@ -1,0 +1,28 @@
+[Unit]
+# Live NIFTY divergence trader + dashboard.
+# Auto-starts on every EC2 boot (instance starts 08:00, stops 16:00, Mon–Fri).
+# The EBS root volume persists live_dashboard.db + CSV across stop/start, and
+# the collector resumes its compounding capital from the DB on each launch.
+Description=Live 5-Min Divergence Trader + Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# __USER__ / __DIR__ are filled in by install_service.sh
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=/bin/bash __DIR__/run.sh
+# Restart only on crash. A clean EOD exit (collector finishing at 15:30) keeps
+# the dashboard alive via run.sh's wait, so the unit stays active until the
+# instance stops at 16:00.
+Restart=on-failure
+RestartSec=10
+# Give children time to flush on instance stop (SIGTERM -> run.sh trap).
+TimeoutStopSec=30
+KillMode=mixed
+StandardOutput=append:__DIR__/service.log
+StandardError=append:__DIR__/service.log
+
+[Install]
+WantedBy=multi-user.target
