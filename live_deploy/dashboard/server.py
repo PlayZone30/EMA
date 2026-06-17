@@ -127,6 +127,65 @@ def api_candles(
         return []
 
 
+@app.get("/api/symbols")
+def api_symbols(
+    date: str = Query(None, description="Trading date YYYY-MM-DD; omit for most recent day with data"),
+):
+    """List option symbols (CE/PE) that have candle data for the given date.
+
+    Powers the dashboard's dynamic option dropdown — since the engine rotates
+    the tracked option through the day, a date can have several CE/PE contracts.
+    """
+    try:
+        import pytz
+        ist = pytz.timezone('Asia/Kolkata')
+        spot = 'NSE:NIFTY50-INDEX'
+        conn = get_db()
+
+        if date and date != 'all':
+            d = datetime.strptime(date, "%Y-%m-%d")
+            day_start = ist.localize(d.replace(hour=0, minute=0, second=0, microsecond=0))
+            day_end = ist.localize(d.replace(hour=23, minute=59, second=59, microsecond=0))
+            rows = conn.execute(
+                "SELECT symbol, COUNT(*) c, MIN(bucket_time) mn, MAX(bucket_time) mx "
+                "FROM candles WHERE symbol != ? AND bucket_time >= ? AND bucket_time <= ? "
+                "GROUP BY symbol ORDER BY mn ASC",
+                (spot, int(day_start.timestamp()), int(day_end.timestamp()))
+            ).fetchall()
+        else:
+            # Default: most recent day that has any candle data
+            latest = conn.execute("SELECT MAX(bucket_time) mx FROM candles").fetchone()
+            if not latest or not latest['mx']:
+                conn.close()
+                return []
+            ld = datetime.fromtimestamp(latest['mx'], tz=ist)
+            day_start = ist.localize(datetime(ld.year, ld.month, ld.day, 0, 0, 0))
+            rows = conn.execute(
+                "SELECT symbol, COUNT(*) c, MIN(bucket_time) mn, MAX(bucket_time) mx "
+                "FROM candles WHERE symbol != ? AND bucket_time >= ? "
+                "GROUP BY symbol ORDER BY mn ASC",
+                (spot, int(day_start.timestamp()))
+            ).fetchall()
+
+        conn.close()
+        out = []
+        for r in rows:
+            sym = r['symbol']
+            # Live Fyers symbols end with CE/PE; seed symbols embed CE_/PE_.
+            opt_type = 'CE' if 'CE' in sym else ('PE' if 'PE' in sym else '?')
+            out.append({
+                'symbol': sym,
+                'type': opt_type,
+                'count': r['c'],
+                'from': r['mn'],
+                'to': r['mx'],
+            })
+        return out
+    except Exception as e:
+        logger.error(f"API symbols error: {e}")
+        return []
+
+
 @app.get("/api/trades")
 def api_trades(
     date: str = Query(None, description="Filter by date (YYYY-MM-DD), 'all', or omit for most recent"),

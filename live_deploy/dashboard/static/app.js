@@ -31,7 +31,9 @@ let optionSeries = null;
 let optionSlLine = null;
 let optionTpLine = null;
 let optionEntryLine = null;
-let activeOptionType = 'ce';   // 'ce' or 'pe'
+let activeOptionType = 'ce';   // legacy fallback ('ce' or 'pe')
+let selectedOptionSymbol = '';  // explicit option contract chosen in the dropdown
+let availableOptionSymbols = []; // [{symbol,type,count,from,to}] for the selected date
 let currentState     = null;
 let lastEventId      = null;
 let syncingCharts    = false;
@@ -250,15 +252,11 @@ async function pollState() {
         chips.innerHTML = '<span class="no-signals">No active signals</span>';
     }
 
-    // Option chart title
-    if (currentState.active_trade) {
+    // Option chart title is managed by pollCandles (follows the selected
+    // contract / dropdown). When an active trade appears, auto-follow it.
+    if (currentState.active_trade && currentState.active_trade.symbol) {
         document.getElementById('optionChartTitle').textContent =
-            (currentState.active_trade.symbol || '').replace('NSE:', '');
-    } else {
-        const sym = activeOptionType === 'ce'
-            ? (currentState.ce_symbol || 'CE')
-            : (currentState.pe_symbol || 'PE');
-        document.getElementById('optionChartTitle').textContent = sym.replace('NSE:', '');
+            currentState.active_trade.symbol.replace('NSE:', '');
     }
 }
 
@@ -275,6 +273,46 @@ async function loadDaySummary(date) {
     pnlEl.className = 'metric-value ' + (pnlVal > 0 ? 'positive' : pnlVal < 0 ? 'negative' : 'neutral');
 
     document.getElementById('signalsValue').textContent = data.signal_count || 0;
+}
+
+// ============ OPTION SYMBOL DROPDOWN (dynamic, rotation-aware) ============
+
+async function loadOptionSymbols() {
+    const url = (selectedDate && selectedDate !== 'all')
+        ? `/api/symbols?date=${selectedDate}` : '/api/symbols';
+    const syms = await fetchJSON(url);
+    availableOptionSymbols = Array.isArray(syms) ? syms : [];
+
+    const sel = document.getElementById('optionSelect');
+    if (!sel) return;
+
+    const prev = selectedOptionSymbol || sel.value;
+
+    if (availableOptionSymbols.length === 0) {
+        sel.innerHTML = '<option value="">—</option>';
+        selectedOptionSymbol = '';
+        return;
+    }
+
+    sel.innerHTML = availableOptionSymbols.map(s => {
+        const label = `${s.symbol.replace('NSE:', '')} (${s.type})`;
+        return `<option value="${s.symbol}">${label}</option>`;
+    }).join('');
+
+    // Preserve prior selection if still present; else default to the active
+    // trade's contract, else the first contract of the day.
+    const symList = availableOptionSymbols.map(s => s.symbol);
+    let pick = '';
+    if (prev && symList.includes(prev)) {
+        pick = prev;
+    } else if (currentState && currentState.active_trade &&
+               symList.includes(currentState.active_trade.symbol)) {
+        pick = currentState.active_trade.symbol;
+    } else {
+        pick = symList[0];
+    }
+    sel.value = pick;
+    selectedOptionSymbol = pick;
 }
 
 // ============ CANDLE POLLING ============
@@ -294,23 +332,26 @@ async function pollCandles() {
         })));
     }
 
-    // Option candles — active trade symbol takes priority over toggle.
-    // When browsing a specific past date, use that date's traded contracts
-    // (state.ce_symbol/pe_symbol are the latest day's, which won't have
-    // candles on an older date).
-    let optSymbol;
-    if (currentState.active_trade) {
-        optSymbol = currentState.active_trade.symbol;
-    } else if (selectedDate && selectedDate !== 'all' &&
-               (selectedDayOptionSymbols.ce || selectedDayOptionSymbols.pe)) {
-        optSymbol = activeOptionType === 'ce'
-            ? selectedDayOptionSymbols.ce
-            : selectedDayOptionSymbols.pe;
-    } else {
-        optSymbol = activeOptionType === 'ce'
-            ? currentState.ce_symbol
-            : currentState.pe_symbol;
+    // Option candles — the dropdown (#optionSelect) is authoritative when the
+    // user has picked a contract. Otherwise auto-follow the active trade, then
+    // fall back to the first available contract for the date.
+    let optSymbol = selectedOptionSymbol;
+    if (!optSymbol) {
+        if (currentState.active_trade) {
+            optSymbol = currentState.active_trade.symbol;
+        } else if (availableOptionSymbols.length > 0) {
+            optSymbol = availableOptionSymbols[0].symbol;
+        } else if (selectedDate && selectedDate !== 'all' &&
+                   (selectedDayOptionSymbols.ce || selectedDayOptionSymbols.pe)) {
+            optSymbol = selectedDayOptionSymbols.ce || selectedDayOptionSymbols.pe;
+        } else {
+            optSymbol = currentState.ce_symbol || currentState.pe_symbol;
+        }
     }
+
+    // Reflect the contract being shown in the chart title.
+    const titleEl = document.getElementById('optionChartTitle');
+    if (titleEl && optSymbol) titleEl.textContent = optSymbol.replace('NSE:', '');
 
     if (optSymbol) {
         const optData = await fetchJSON(
@@ -602,9 +643,12 @@ async function pollEvents() {
 async function onDateChange() {
     const dateVal = document.getElementById('dateFilter').value;
     selectedDate = dateVal;
+    // Reset the contract selection so the dropdown re-populates for the new date.
+    selectedOptionSymbol = '';
     // Load trades first so selectedDayOptionSymbols is populated before the
     // option chart is redrawn for the newly selected date.
     await loadTrades();
+    await loadOptionSymbols();
     loadDaySummary(selectedDate);
     pollCandles();
 }
@@ -617,17 +661,9 @@ document.addEventListener('DOMContentLoaded', () => {
     ({ chart: optionChart, series: optionSeries } = createChart('optionChartContainer'));
     setupChartSync(spotChart, optionChart);
 
-    // CE/PE toggle
-    document.getElementById('btnCE').addEventListener('click', () => {
-        activeOptionType = 'ce';
-        document.getElementById('btnCE').classList.add('active');
-        document.getElementById('btnPE').classList.remove('active');
-        pollCandles();
-    });
-    document.getElementById('btnPE').addEventListener('click', () => {
-        activeOptionType = 'pe';
-        document.getElementById('btnPE').classList.add('active');
-        document.getElementById('btnCE').classList.remove('active');
+    // Option contract dropdown — user pick is authoritative.
+    document.getElementById('optionSelect').addEventListener('change', (e) => {
+        selectedOptionSymbol = e.target.value || '';
         pollCandles();
     });
 
@@ -644,9 +680,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initial load order:
     // 1. State (gives Capital + Spot immediately)
     // 2. Trade dates → sets dropdown → triggers loadTrades + loadDaySummary + pollCandles
-    // 3. Events
+    // 3. Option symbols → populate the contract dropdown
+    // 4. Events
     pollState().then(() => {
         loadTradeDates();   // async: sets dropdown, then loads everything date-dependent
+        loadOptionSymbols().then(pollCandles);
         pollEvents();
     });
 
@@ -657,4 +695,5 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => loadDaySummary(selectedDate), POLL_SUMMARY_MS);
     setInterval(loadTrades,       10000);
     setInterval(loadTradeDates,   30000);
+    setInterval(loadOptionSymbols, 15000);  // refresh contract list (rotation adds new ones)
 });
