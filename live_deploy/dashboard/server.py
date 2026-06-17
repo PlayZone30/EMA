@@ -395,7 +395,7 @@ def api_events(
 def serve_index():
     index_path = STATIC_DIR / 'index.html'
     if index_path.exists():
-        return FileResponse(str(index_path))
+        return FileResponse(str(index_path), headers={"Cache-Control": "no-cache"})
     return JSONResponse({"error": "index.html not found"}, status_code=404)
 
 

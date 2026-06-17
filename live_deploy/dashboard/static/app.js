@@ -275,33 +275,42 @@ async function loadDaySummary(date) {
     document.getElementById('signalsValue').textContent = data.signal_count || 0;
 }
 
-// ============ OPTION SYMBOL DROPDOWN (dynamic, rotation-aware) ============
+// ============ OPTION SYMBOL DROPDOWN (dynamic, rotation-aware, CE/PE scoped) ============
 
 async function loadOptionSymbols() {
     const url = (selectedDate && selectedDate !== 'all')
         ? `/api/symbols?date=${selectedDate}` : '/api/symbols';
     const syms = await fetchJSON(url);
     availableOptionSymbols = Array.isArray(syms) ? syms : [];
+    populateOptionDropdown();
+}
 
+// Populate the dropdown with only the contracts matching the active CE/PE tab.
+// As option rotation adds new contracts, they appear here for the chosen side.
+function populateOptionDropdown() {
     const sel = document.getElementById('optionSelect');
     if (!sel) return;
 
+    const wantType = activeOptionType.toUpperCase(); // 'CE' or 'PE'
+    const list = availableOptionSymbols.filter(s => s.type === wantType);
     const prev = selectedOptionSymbol || sel.value;
 
-    if (availableOptionSymbols.length === 0) {
+    if (list.length === 0) {
         sel.innerHTML = '<option value="">—</option>';
-        selectedOptionSymbol = '';
+        // fall back to the live state symbol for this side, if any
+        selectedOptionSymbol = (wantType === 'CE'
+            ? (currentState && currentState.ce_symbol)
+            : (currentState && currentState.pe_symbol)) || '';
         return;
     }
 
-    sel.innerHTML = availableOptionSymbols.map(s => {
-        const label = `${s.symbol.replace('NSE:', '')} (${s.type})`;
-        return `<option value="${s.symbol}">${label}</option>`;
-    }).join('');
+    sel.innerHTML = list.map(s =>
+        `<option value="${s.symbol}">${s.symbol.replace('NSE:', '')}</option>`
+    ).join('');
 
-    // Preserve prior selection if still present; else default to the active
-    // trade's contract, else the first contract of the day.
-    const symList = availableOptionSymbols.map(s => s.symbol);
+    // Keep prior selection if it's still in this side's list; else default to
+    // the active trade's contract (if it matches the side) or the latest one.
+    const symList = list.map(s => s.symbol);
     let pick = '';
     if (prev && symList.includes(prev)) {
         pick = prev;
@@ -309,7 +318,7 @@ async function loadOptionSymbols() {
                symList.includes(currentState.active_trade.symbol)) {
         pick = currentState.active_trade.symbol;
     } else {
-        pick = symList[0];
+        pick = symList[symList.length - 1]; // most recent contract of this side
     }
     sel.value = pick;
     selectedOptionSymbol = pick;
@@ -332,20 +341,18 @@ async function pollCandles() {
         })));
     }
 
-    // Option candles — the dropdown (#optionSelect) is authoritative when the
-    // user has picked a contract. Otherwise auto-follow the active trade, then
-    // fall back to the first available contract for the date.
+    // Option candles — the dropdown (#optionSelect) is authoritative; it's
+    // scoped to the active CE/PE tab. Fallbacks also respect that tab.
     let optSymbol = selectedOptionSymbol;
     if (!optSymbol) {
-        if (currentState.active_trade) {
+        const wantType = activeOptionType.toUpperCase();
+        const ofType = availableOptionSymbols.filter(s => s.type === wantType).map(s => s.symbol);
+        if (currentState.active_trade && ofType.includes(currentState.active_trade.symbol)) {
             optSymbol = currentState.active_trade.symbol;
-        } else if (availableOptionSymbols.length > 0) {
-            optSymbol = availableOptionSymbols[0].symbol;
-        } else if (selectedDate && selectedDate !== 'all' &&
-                   (selectedDayOptionSymbols.ce || selectedDayOptionSymbols.pe)) {
-            optSymbol = selectedDayOptionSymbols.ce || selectedDayOptionSymbols.pe;
+        } else if (ofType.length > 0) {
+            optSymbol = ofType[ofType.length - 1];
         } else {
-            optSymbol = currentState.ce_symbol || currentState.pe_symbol;
+            optSymbol = wantType === 'CE' ? currentState.ce_symbol : currentState.pe_symbol;
         }
     }
 
@@ -660,6 +667,24 @@ document.addEventListener('DOMContentLoaded', () => {
     ({ chart: spotChart, series: spotSeries } = createChart('spotChartContainer'));
     ({ chart: optionChart, series: optionSeries } = createChart('optionChartContainer'));
     setupChartSync(spotChart, optionChart);
+
+    // CE/PE tab — switches which side's contracts the dropdown lists.
+    document.getElementById('btnCE').addEventListener('click', () => {
+        activeOptionType = 'ce';
+        document.getElementById('btnCE').classList.add('active');
+        document.getElementById('btnPE').classList.remove('active');
+        selectedOptionSymbol = '';
+        populateOptionDropdown();
+        pollCandles();
+    });
+    document.getElementById('btnPE').addEventListener('click', () => {
+        activeOptionType = 'pe';
+        document.getElementById('btnPE').classList.add('active');
+        document.getElementById('btnCE').classList.remove('active');
+        selectedOptionSymbol = '';
+        populateOptionDropdown();
+        pollCandles();
+    });
 
     // Option contract dropdown — user pick is authoritative.
     document.getElementById('optionSelect').addEventListener('change', (e) => {

@@ -14,7 +14,7 @@
     <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     
     <!-- Styles -->
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 
@@ -84,9 +84,15 @@
             <div class="card chart-container">
                 <div class="card-header">
                     <span class="card-title" id="optionChartTitle">Option</span>
-                    <select class="date-filter" id="optionSelect" title="Select option contract">
-                        <option value="">—</option>
-                    </select>
+                    <div class="option-controls">
+                        <div class="chart-toggle" id="optionToggle">
+                            <button class="active" data-type="ce" id="btnCE">CE</button>
+                            <button data-type="pe" id="btnPE">PE</button>
+                        </div>
+                        <select class="date-filter" id="optionSelect" title="Select contract">
+                            <option value="">—</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="card-body" id="optionChartContainer"></div>
             </div>
@@ -134,6 +140,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 </html>

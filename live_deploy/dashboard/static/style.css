@@ -302,6 +302,12 @@ body {
     gap: 4px;
 }
 
+.option-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
 .chart-toggle button {
     padding: 4px 10px;
     border: 1px solid var(--border);
