@@ -69,7 +69,8 @@ STRIKE_STEP = 50
 OPTION_REFRESH_SECONDS = 600
 API_DELAY = 0.6
 TRADE_LOG_FILE = "live_5min_trades.csv"
-MARKET_OPEN = dt_time(9, 30)  # No trades before 9:30 AM
+MARKET_DATA_OPEN = dt_time(9, 15)  # Start collecting candles here (NSE open) — feeds avg candle size
+MARKET_OPEN = dt_time(9, 30)  # No ENTRIES before 9:30 (data still collected from 9:15)
 MARKET_CLOSE = dt_time(15, 30)
 
 # ---------- A8: Deterministic time through CandleManager ----------
@@ -680,21 +681,66 @@ class Live5MinEngine:
 
     def run(self):
         logger.info("🚀 LIVE 5-MIN TRADER | SL=max(Risk,Avg), TP=2.5x RR")
-        if not self.authenticate(): return
-        
-        # Initialize dashboard DB (Part B)
-        self._init_db()
-        
-        now = datetime.now(IST)
-        if now.time() < MARKET_OPEN:
-            tgt = now.replace(hour=9, minute=30, second=0, microsecond=0)
-            wait = (tgt - now).total_seconds()
-            logger.info(f"⏳ Waiting {int(wait)}s for 09:30 AM open...")
-            time.sleep(max(0, wait - 10))
 
-        ce, pe = self.find_options_in_range()
-        if not ce or not pe: return
+        # Initialize dashboard DB first (no auth needed). Resumes capital and
+        # gives the dashboard a state row even before the market opens.
+        self._init_db()
+
+        # ---- Wait for MARKET DATA OPEN (09:15) BEFORE authenticating ----
+        # We connect at 09:15 (NSE open) so candles from 09:15 onward are
+        # captured — these feed avg_candle_size for the SL. Entries are still
+        # gated at 09:30 (MARKET_OPEN) inside _on_message.
+        # Authenticating just before open also keeps the Fyers token fresh
+        # (a boot that authed hours earlier had a stale token by open).
+        now = datetime.now(IST)
+        if now.time() < MARKET_DATA_OPEN:
+            tgt = now.replace(hour=MARKET_DATA_OPEN.hour, minute=MARKET_DATA_OPEN.minute,
+                              second=0, microsecond=0)
+            wait = (tgt - now).total_seconds()
+            logger.info(f"⏳ Waiting {int(wait)}s until {MARKET_DATA_OPEN.strftime('%H:%M')} (NSE open) before authenticating...")
+            self._stop_event.wait(timeout=max(0, wait - 30))
+
+        if self._stop_event.is_set():
+            return
+
+        # If the process starts after market close, there's nothing to trade.
+        if datetime.now(IST).time() > MARKET_CLOSE:
+            logger.info("⏹️  Started after market close — nothing to do today.")
+            self._eod_done = True
+            self._db_write_state(force=True)
+            return
+
+        # ---- Authenticate (retry instead of exiting) ----
+        while not self._stop_event.is_set():
+            if self.authenticate():
+                break
+            logger.warning("⚠️ Auth failed — retrying in 30s...")
+            self._db_log_event('INFO', 'Authentication failed, retrying in 30s')
+            self._stop_event.wait(timeout=30)
+        if self._stop_event.is_set():
+            return
+
+        # ---- Find tradable options (retry instead of exiting) ----
+        ce = pe = None
+        attempts = 0
+        while not self._stop_event.is_set():
+            ce, pe = self.find_options_in_range()
+            if ce and pe:
+                break
+            attempts += 1
+            logger.warning(f"⚠️ Could not find options (attempt {attempts}) — retrying in 20s...")
+            if attempts == 1:
+                self._db_log_event('INFO', 'Searching for tradable options...')
+            # Re-auth periodically in case the token is the problem.
+            if attempts % 5 == 0:
+                logger.info("🔑 Re-authenticating before next option search...")
+                self.authenticate()
+            self._stop_event.wait(timeout=20)
+        if self._stop_event.is_set():
+            return
         self.ce_symbol, self.pe_symbol = ce, pe
+        logger.info(f"📡 Trading {self.ce_symbol} / {self.pe_symbol}")
+        self._db_write_state(force=True)
 
         self.fyers_ws = data_ws.FyersDataSocket(
             access_token=self.access_token, log_path="", litemode=False,
