@@ -4,6 +4,11 @@
  * Poll-based architecture (no WebSocket needed).
  * Uses lightweight-charts v4.2.3 (v4 API: addCandlestickSeries).
  *
+ * Fixed-universe model: the engine subscribes ~60 strikes and no longer
+ * persists live tick candles. There is no single "current" CE/PE contract, so
+ * the live spot/option chart panels were removed. Charts are shown ONLY in the
+ * trade-detail modal, backfilled from the History API when a trade executes.
+ *
  * Header behaviour:
  *   Capital  → always from /api/state  (final account balance, never date-filtered)
  *   Spot     → always from /api/state  (current/last known LTP, never date-filtered)
@@ -18,36 +23,19 @@
 
 const IST_OFFSET = 19800; // +5:30 in seconds
 const POLL_STATE_MS   = 2500;
-const POLL_CANDLE_MS  = 5000;
 const POLL_EVENTS_MS  = 3000;
 const POLL_SUMMARY_MS = 5000;
 
 // ============ STATE ============
 
-let spotChart    = null;
-let spotSeries   = null;
-let optionChart  = null;
-let optionSeries = null;
-let optionSlLine = null;
-let optionTpLine = null;
-let optionEntryLine = null;
-let activeOptionType = 'ce';   // legacy fallback ('ce' or 'pe')
-let selectedOptionSymbol = '';  // explicit option contract chosen in the dropdown
-let availableOptionSymbols = []; // [{symbol,type,count,from,to}] for the selected date
 let currentState     = null;
 let lastEventId      = null;
-let syncingCharts    = false;
 let modalSpotChart   = null;
 let modalOptionChart = null;
 
-// The date currently shown in the trade journal / charts / summary.
-// Kept in sync with the <select> value.
-let selectedDate = '';   // '' means "use server default (most recent)"
-
-// Option symbols (CE/PE) actually traded on the currently-selected date.
-// Used so the option chart shows the right contract when browsing a PAST date,
-// where state.ce_symbol/pe_symbol (the latest day's contracts) would not match.
-let selectedDayOptionSymbols = { ce: null, pe: null };
+// The date currently shown in the trade journal / summary.
+// Kept in sync with the <select> value. '' means "use server default".
+let selectedDate = '';
 
 // Guards the one-time full refresh triggered from loadTradeDates().
 let dateDropdownInitialized = false;
@@ -100,45 +88,6 @@ async function fetchJSON(url) {
     }
 }
 
-// ============ CHART CREATION ============
-
-function createChart(containerId, height) {
-    const container = document.getElementById(containerId);
-    if (!container) return { chart: null, series: null };
-    container.innerHTML = '';
-
-    const chart = LightweightCharts.createChart(container, {
-        width: container.clientWidth,
-        height: height || container.clientHeight || 300,
-        layout: {
-            background: { type: 'solid', color: 'transparent' },
-            textColor: '#94a3b8', fontSize: 11, fontFamily: 'Inter, sans-serif',
-        },
-        grid: {
-            vertLines: { color: 'rgba(55, 65, 81, 0.3)' },
-            horzLines: { color: 'rgba(55, 65, 81, 0.3)' },
-        },
-        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-        rightPriceScale: { borderColor: 'rgba(55, 65, 81, 0.5)' },
-        timeScale: { borderColor: 'rgba(55, 65, 81, 0.5)', timeVisible: true, secondsVisible: false },
-    });
-
-    const series = chart.addCandlestickSeries({
-        upColor: '#22c55e', downColor: '#ef4444',
-        borderUpColor: '#22c55e', borderDownColor: '#ef4444',
-        wickUpColor: '#22c55e', wickDownColor: '#ef4444',
-    });
-
-    const ro = new ResizeObserver(entries => {
-        for (const e of entries) {
-            chart.applyOptions({ width: e.contentRect.width, height: e.contentRect.height });
-        }
-    });
-    ro.observe(container);
-
-    return { chart, series };
-}
-
 function addPriceLine(series, price, color, title, lineStyle) {
     if (!series || price == null) return null;
     return series.createPriceLine({
@@ -154,21 +103,7 @@ function setMarkers(series, markers) {
     catch (e) { console.error('setMarkers error:', e); }
 }
 
-// ============ CHART SYNC ============
-
-function setupChartSync(c1, c2) {
-    if (!c1 || !c2) return;
-    c1.timeScale().subscribeVisibleLogicalRangeChange(r => {
-        if (syncingCharts || !r) return;
-        syncingCharts = true; c2.timeScale().setVisibleLogicalRange(r); syncingCharts = false;
-    });
-    c2.timeScale().subscribeVisibleLogicalRangeChange(r => {
-        if (syncingCharts || !r) return;
-        syncingCharts = true; c1.timeScale().setVisibleLogicalRange(r); syncingCharts = false;
-    });
-}
-
-// ============ STATE POLLING (Capital + Spot only) ============
+// ============ STATE POLLING (Capital + Spot + active trade + pending) ============
 
 async function pollState() {
     const data = await fetchJSON('/api/state');
@@ -201,8 +136,7 @@ async function pollState() {
     document.getElementById('spotValue').textContent =
         currentState.spot_ltp != null ? Number(currentState.spot_ltp).toFixed(2) : '—';
 
-    // Day P&L and Signals are intentionally NOT updated here.
-    // They are driven by loadDaySummary() so they track the selected date.
+    // Day P&L and Signals are driven by loadDaySummary() (date-aware).
 
     // Active trade card
     const tradeCard = document.getElementById('activeTradeCard');
@@ -212,12 +146,17 @@ async function pollState() {
     if (currentState.active_trade) {
         tradeCard.style.display = 'block';
         const t = currentState.active_trade;
-        const optLtp = t.type === 'CE_BUY' ? currentState.ce_ltp : currentState.pe_ltp;
+        // Fixed-universe model: the traded contract's current price is carried
+        // on the active_trade blob itself (state.ltps no longer exposes a single CE/PE).
+        const optLtp = t.ltp;
 
         if (optLtp != null) {
             const uPnl = (optLtp - t.entry) * 65 * (t.lots || 1);
             unrealPnl.textContent = formatINR(uPnl);
             unrealPnl.className = 'metric-value ' + (uPnl >= 0 ? 'positive' : 'negative');
+        } else {
+            unrealPnl.textContent = '—';
+            unrealPnl.className = 'metric-value neutral';
         }
 
         let timeInTrade = '—';
@@ -251,13 +190,6 @@ async function pollState() {
     } else {
         chips.innerHTML = '<span class="no-signals">No active signals</span>';
     }
-
-    // Option chart title is managed by pollCandles (follows the selected
-    // contract / dropdown). When an active trade appears, auto-follow it.
-    if (currentState.active_trade && currentState.active_trade.symbol) {
-        document.getElementById('optionChartTitle').textContent =
-            currentState.active_trade.symbol.replace('NSE:', '');
-    }
 }
 
 // ============ DAY SUMMARY (Day P&L + Signals — date-aware) ============
@@ -275,157 +207,6 @@ async function loadDaySummary(date) {
     document.getElementById('signalsValue').textContent = data.signal_count || 0;
 }
 
-// ============ OPTION SYMBOL DROPDOWN (dynamic, rotation-aware, CE/PE scoped) ============
-
-async function loadOptionSymbols() {
-    const url = (selectedDate && selectedDate !== 'all')
-        ? `/api/symbols?date=${selectedDate}` : '/api/symbols';
-    const syms = await fetchJSON(url);
-    availableOptionSymbols = Array.isArray(syms) ? syms : [];
-    populateOptionDropdown();
-}
-
-// Populate the dropdown with only the contracts matching the active CE/PE tab.
-// As option rotation adds new contracts, they appear here for the chosen side.
-function populateOptionDropdown() {
-    const sel = document.getElementById('optionSelect');
-    if (!sel) return;
-
-    const wantType = activeOptionType.toUpperCase(); // 'CE' or 'PE'
-    const list = availableOptionSymbols.filter(s => s.type === wantType);
-    const prev = selectedOptionSymbol || sel.value;
-
-    if (list.length === 0) {
-        sel.innerHTML = '<option value="">—</option>';
-        // fall back to the live state symbol for this side, if any
-        selectedOptionSymbol = (wantType === 'CE'
-            ? (currentState && currentState.ce_symbol)
-            : (currentState && currentState.pe_symbol)) || '';
-        return;
-    }
-
-    sel.innerHTML = list.map(s =>
-        `<option value="${s.symbol}">${s.symbol.replace('NSE:', '')}</option>`
-    ).join('');
-
-    // Keep prior selection if it's still in this side's list; else default to
-    // the active trade's contract (if it matches the side) or the latest one.
-    const symList = list.map(s => s.symbol);
-    let pick = '';
-    if (prev && symList.includes(prev)) {
-        pick = prev;
-    } else if (currentState && currentState.active_trade &&
-               symList.includes(currentState.active_trade.symbol)) {
-        pick = currentState.active_trade.symbol;
-    } else {
-        pick = symList[symList.length - 1]; // most recent contract of this side
-    }
-    sel.value = pick;
-    selectedOptionSymbol = pick;
-}
-
-// ============ CANDLE POLLING ============
-
-async function pollCandles() {
-    if (!currentState) return;
-
-    const dateParam = selectedDate ? `&date=${selectedDate}` : '';
-
-    // Spot candles
-    const spotData = await fetchJSON(
-        `/api/candles?symbol=${encodeURIComponent('NSE:NIFTY50-INDEX')}${dateParam}`
-    );
-    if (spotData && spotSeries) {
-        spotSeries.setData(spotData.map(c => ({
-            time: toIST(c.time), open: c.open, high: c.high, low: c.low, close: c.close,
-        })));
-    }
-
-    // Option candles — the dropdown (#optionSelect) is authoritative; it's
-    // scoped to the active CE/PE tab. Fallbacks also respect that tab.
-    let optSymbol = selectedOptionSymbol;
-    if (!optSymbol) {
-        const wantType = activeOptionType.toUpperCase();
-        const ofType = availableOptionSymbols.filter(s => s.type === wantType).map(s => s.symbol);
-        if (currentState.active_trade && ofType.includes(currentState.active_trade.symbol)) {
-            optSymbol = currentState.active_trade.symbol;
-        } else if (ofType.length > 0) {
-            optSymbol = ofType[ofType.length - 1];
-        } else {
-            optSymbol = wantType === 'CE' ? currentState.ce_symbol : currentState.pe_symbol;
-        }
-    }
-
-    // Reflect the contract being shown in the chart title.
-    const titleEl = document.getElementById('optionChartTitle');
-    if (titleEl && optSymbol) titleEl.textContent = optSymbol.replace('NSE:', '');
-
-    if (optSymbol) {
-        const optData = await fetchJSON(
-            `/api/candles?symbol=${encodeURIComponent(optSymbol)}${dateParam}`
-        );
-        if (optData && optionSeries) {
-            optionSeries.setData(optData.map(c => ({
-                time: toIST(c.time), open: c.open, high: c.high, low: c.low, close: c.close,
-            })));
-
-            // Remove old SL/TP/Entry lines
-            if (optionSlLine) { try { optionSeries.removePriceLine(optionSlLine); } catch {} }
-            if (optionTpLine) { try { optionSeries.removePriceLine(optionTpLine); } catch {} }
-            if (optionEntryLine) { try { optionSeries.removePriceLine(optionEntryLine); } catch {} }
-            optionSlLine = null; optionTpLine = null; optionEntryLine = null;
-
-            if (currentState.active_trade && currentState.active_trade.symbol === optSymbol) {
-                optionSlLine = addPriceLine(optionSeries, currentState.active_trade.sl, '#ef4444', 'SL');
-                optionTpLine = addPriceLine(optionSeries, currentState.active_trade.tp, '#22c55e', 'TP');
-                optionEntryLine = addPriceLine(optionSeries, currentState.active_trade.entry, '#3b82f6', 'ENTRY',
-                    LightweightCharts.LineStyle.Solid);
-            }
-
-            await addTradeMarkers(optSymbol, optionSeries);
-        }
-    } else if (optionSeries) {
-        // No contract for this date/toggle — clear the option chart.
-        optionSeries.setData([]);
-        if (optionSlLine) { try { optionSeries.removePriceLine(optionSlLine); } catch {} optionSlLine = null; }
-        if (optionTpLine) { try { optionSeries.removePriceLine(optionTpLine); } catch {} optionTpLine = null; }
-        if (optionEntryLine) { try { optionSeries.removePriceLine(optionEntryLine); } catch {} optionEntryLine = null; }
-        try { optionSeries.setMarkers([]); } catch {}
-    }
-}
-
-async function addTradeMarkers(symbol, series) {
-    const dateParam = selectedDate ? `?date=${selectedDate}` : '';
-    const trades = await fetchJSON(`/api/trades${dateParam}`);
-    if (!trades || !series) return;
-
-    const markers = [];
-    for (const t of trades) {
-        if (t.symbol !== symbol) continue;
-        if (t.entry_time) {
-            try {
-                markers.push({
-                    time: toBarTime(new Date(t.entry_time).getTime() / 1000),
-                    position: 'belowBar', color: '#22c55e', shape: 'arrowUp',
-                    text: `ENTRY ${Number(t.entry_price).toFixed(1)}`,
-                });
-            } catch {}
-        }
-        if (t.exit_time) {
-            try {
-                markers.push({
-                    time: toBarTime(new Date(t.exit_time).getTime() / 1000),
-                    position: 'aboveBar',
-                    color: t.exit_reason === 'TP' ? '#22c55e' : '#ef4444',
-                    shape: 'arrowDown',
-                    text: `${t.exit_reason} ${Number(t.exit_price).toFixed(1)}`,
-                });
-            } catch {}
-        }
-    }
-    setMarkers(series, markers);
-}
-
 // ============ TRADE LOG ============
 
 async function loadTrades() {
@@ -437,20 +218,9 @@ async function loadTrades() {
     const list = document.getElementById('tradeList');
 
     if (!trades || trades.length === 0) {
-        selectedDayOptionSymbols = { ce: null, pe: null };
         list.innerHTML = '<div class="no-trades">No trades yet</div>';
         return;
     }
-
-    // Capture the CE/PE contracts traded on this date so the option chart can
-    // render them when browsing history (most recent trade of each type wins).
-    const ceSyms = { ce: null, pe: null };
-    for (const t of trades) {
-        const isCe = (t.type || '').toUpperCase().includes('CE');
-        if (isCe) ceSyms.ce = t.symbol;
-        else ceSyms.pe = t.symbol;
-    }
-    selectedDayOptionSymbols = ceSyms;
 
     list.innerHTML = trades.map(t => {
         const pnl = t.pnl_total || 0;
@@ -470,7 +240,7 @@ async function loadTradeDates() {
     const select = document.getElementById('dateFilter');
 
     // Preserve whatever the user currently has selected so the periodic refresh
-    // (every 30s) doesn't clobber their chosen date.
+    // doesn't clobber their chosen date.
     const prev = select.value;
 
     select.innerHTML = '<option value="">Today</option>';
@@ -482,28 +252,22 @@ async function loadTradeDates() {
 
         const today = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD local
 
-        // Restore prior selection if it still exists in the list.
         if (prev && (prev === 'all' || prev === '' || dates.includes(prev))) {
             select.value = prev;
             selectedDate = prev;
         } else if (!dates.includes(today)) {
-            // First load with no live data for today → default to most recent.
             select.value = dates[0]; // dates are DESC, so [0] is most recent
             selectedDate = dates[0];
         }
     } else if (prev) {
-        // No dates returned but keep prior selection value if any.
         select.value = prev === 'all' ? '' : prev;
     }
 
-    // Only do a full date-dependent refresh on the FIRST load. On the periodic
-    // 30s refresh the selection is unchanged, so we skip the reload to avoid
-    // fighting the user / re-fetching needlessly.
+    // Only do a full date-dependent refresh on the FIRST load.
     if (!dateDropdownInitialized) {
         dateDropdownInitialized = true;
         await loadTrades();
         await loadDaySummary(selectedDate);
-        await pollCandles();
     }
 }
 
@@ -650,48 +414,13 @@ async function pollEvents() {
 async function onDateChange() {
     const dateVal = document.getElementById('dateFilter').value;
     selectedDate = dateVal;
-    // Reset the contract selection so the dropdown re-populates for the new date.
-    selectedOptionSymbol = '';
-    // Load trades first so selectedDayOptionSymbols is populated before the
-    // option chart is redrawn for the newly selected date.
     await loadTrades();
-    await loadOptionSymbols();
     loadDaySummary(selectedDate);
-    pollCandles();
 }
 
 // ============ INIT ============
 
 document.addEventListener('DOMContentLoaded', () => {
-    // Create main charts
-    ({ chart: spotChart, series: spotSeries } = createChart('spotChartContainer'));
-    ({ chart: optionChart, series: optionSeries } = createChart('optionChartContainer'));
-    setupChartSync(spotChart, optionChart);
-
-    // CE/PE tab — switches which side's contracts the dropdown lists.
-    document.getElementById('btnCE').addEventListener('click', () => {
-        activeOptionType = 'ce';
-        document.getElementById('btnCE').classList.add('active');
-        document.getElementById('btnPE').classList.remove('active');
-        selectedOptionSymbol = '';
-        populateOptionDropdown();
-        pollCandles();
-    });
-    document.getElementById('btnPE').addEventListener('click', () => {
-        activeOptionType = 'pe';
-        document.getElementById('btnPE').classList.add('active');
-        document.getElementById('btnCE').classList.remove('active');
-        selectedOptionSymbol = '';
-        populateOptionDropdown();
-        pollCandles();
-    });
-
-    // Option contract dropdown — user pick is authoritative.
-    document.getElementById('optionSelect').addEventListener('change', (e) => {
-        selectedOptionSymbol = e.target.value || '';
-        pollCandles();
-    });
-
     // Date filter — single handler
     document.getElementById('dateFilter').addEventListener('change', onDateChange);
 
@@ -703,22 +432,21 @@ document.addEventListener('DOMContentLoaded', () => {
     document.addEventListener('keydown', e => { if (e.key === 'Escape') closeTradeModal(); });
 
     // Initial load order:
-    // 1. State (gives Capital + Spot immediately)
-    // 2. Trade dates → sets dropdown → triggers loadTrades + loadDaySummary + pollCandles
-    // 3. Option symbols → populate the contract dropdown
-    // 4. Events
+    // 1. State (gives Capital + Spot + active trade immediately)
+    // 2. Trade dates → sets dropdown → triggers loadTrades + loadDaySummary
+    // 3. Events
     pollState().then(() => {
-        loadTradeDates();   // async: sets dropdown, then loads everything date-dependent
-        loadOptionSymbols().then(pollCandles);
+        loadTradeDates();
         pollEvents();
     });
 
     // Polling intervals
-    setInterval(pollState,        POLL_STATE_MS);
-    setInterval(pollCandles,      POLL_CANDLE_MS);
-    setInterval(pollEvents,       POLL_EVENTS_MS);
+    setInterval(pollState,  POLL_STATE_MS);
+    setInterval(pollEvents, POLL_EVENTS_MS);
     setInterval(() => loadDaySummary(selectedDate), POLL_SUMMARY_MS);
-    setInterval(loadTrades,       10000);
-    setInterval(loadTradeDates,   30000);
-    setInterval(loadOptionSymbols, 15000);  // refresh contract list (rotation adds new ones)
+    setInterval(loadTrades, 10000);
+    setInterval(loadTradeDates, 30000);
 });
+
+// Expose modal opener for inline onclick handlers in the trade list.
+window.openTradeModal = openTradeModal;

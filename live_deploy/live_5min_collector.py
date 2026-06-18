@@ -362,6 +362,7 @@ class Live5MinEngine:
                     'entry': t.entry_price, 'sl': t.sl, 'tp': t.tp,
                     'lots': t.lots, 'highest': t.highest_reached,
                     'reason': t.reason, 'entry_time': t.entry_time.isoformat(),
+                    'ltp': self.ltps.get(t.symbol),
                 }
             
             pending_list = []

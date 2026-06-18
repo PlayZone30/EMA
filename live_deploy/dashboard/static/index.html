@@ -14,7 +14,7 @@
     <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
     
     <!-- Styles -->
-    <link rel="stylesheet" href="/static/style.css?v=3">
+    <link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
 
@@ -73,31 +73,6 @@
             </div>
         </div>
 
-        <!-- Charts Section -->
-        <div class="charts-section">
-            <div class="card chart-container">
-                <div class="card-header">
-                    <span class="card-title">NIFTY 50 Spot</span>
-                </div>
-                <div class="card-body" id="spotChartContainer"></div>
-            </div>
-            <div class="card chart-container">
-                <div class="card-header">
-                    <span class="card-title" id="optionChartTitle">Option</span>
-                    <div class="option-controls">
-                        <div class="chart-toggle" id="optionToggle">
-                            <button class="active" data-type="ce" id="btnCE">CE</button>
-                            <button data-type="pe" id="btnPE">PE</button>
-                        </div>
-                        <select class="date-filter" id="optionSelect" title="Select contract">
-                            <option value="">—</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="card-body" id="optionChartContainer"></div>
-            </div>
-        </div>
-
         <!-- Bottom: Trade Log + Event Feed -->
         <div class="bottom-section">
             <!-- Trade Log -->
@@ -140,6 +115,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=3"></script>
+    <script src="/static/app.js?v=4"></script>
 </body>
 </html>
