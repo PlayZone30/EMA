@@ -94,7 +94,9 @@ class DashboardDB:
                 signal_reason TEXT,
                 signal_time TEXT,
                 signal_high REAL,
-                signal_low REAL
+                signal_low REAL,
+                signal_open REAL,
+                signal_close REAL
             );
             
             CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date);
@@ -110,6 +112,23 @@ class DashboardDB:
             CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         """)
         conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns introduced after the original schema (idempotent).
+
+        Existing EBS-persisted DBs were created before signal_open/signal_close
+        existed; add them if missing so insert_trade never fails.
+        """
+        try:
+            conn = self._get_conn()
+            cols = {r['name'] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            for col in ('signal_open', 'signal_close'):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} REAL")
+            conn.commit()
+        except Exception as e:
+            logger.error(f"DB migrate error: {e}")
     
     # ---- Candles ----
     
@@ -178,8 +197,8 @@ class DashboardDB:
                 INSERT INTO trades (date, type, symbol, lots, entry_time, exit_time,
                     entry_price, exit_price, sl, tp, risk, highest_reached,
                     pnl_per_unit, pnl_total, capital_after, exit_reason, signal_reason,
-                    signal_time, signal_high, signal_low)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    signal_time, signal_high, signal_low, signal_open, signal_close)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 date_str, trade['type'], trade['symbol'], trade['lots'],
                 entry_time, exit_time,
@@ -188,6 +207,7 @@ class DashboardDB:
                 trade['highest_reached'], trade['pnl_per_unit'], trade['pnl_total'],
                 capital_after, trade['exit_reason'], trade.get('reason', ''),
                 signal_time, trade.get('signal_high'), trade.get('signal_low'),
+                trade.get('signal_open'), trade.get('signal_close'),
             ))
             conn.commit()
         except Exception as e:

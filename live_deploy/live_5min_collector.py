@@ -1,7 +1,17 @@
 """
-Live Forward Test: 5-Min Divergence Strategy 
+Live Forward Test: 5-Min Divergence Strategy
 =============================================================
 Uses WebSocket tick data for real-time paper trading.
+
+Architecture (fixed-universe model — no mid-day rotation):
+- At startup, pick the nearest weekly expiry and subscribe a FIXED universe of
+  STRIKES_PER_SIDE OTM CE strikes (ATM and above) + STRIKES_PER_SIDE OTM PE
+  strikes (ATM and below), plus spot. These are held all day — no rotation,
+  no mid-bucket re-subscribe, no candle_history wipe. (WS cap is 5000 symbols.)
+- Divergence is evaluated on EVERY subscribed strike against the spot candle.
+- A candidate signal proceeds only if the option's signal-candle price is in
+  [OPTION_PRICE_MIN, OPTION_PRICE_MAX]; ties broken by closeness to
+  OPTION_PRICE_TARGET; one position at a time.
 
 Strategy:
 - Divergence Signal on 5-min candles:
@@ -10,13 +20,21 @@ Strategy:
 - Case 1 Entry Only: Tick LTP > divergence candle's high BEFORE breaking low.
   - If ltp < sig_low -> signal invalid.
   - If next 5-min candle closes without triggering -> signal invalid.
+- Signal integrity (History-confirm): the websocket candle only DETECTS a
+  candidate; before arming we confirm that bucket's OHLC via the Fyers History
+  API (authoritative) and use the History high/low for the entry trigger. This
+  prevents phantom signals from sparse/missed option ticks.
 - Dynamic Risk Management:
-  - avg_candle_size = average high-low of past candles today
+  - avg_candle_size = average high-low of History candles 09:15..signal candle
   - orig_risk = entry - sig_low
   - final_risk = max(orig_risk, avg_candle_size)
   - SL = max(Entry - final_risk, 0.05)  [clamped to prevent negative]
   - TP = Entry + (2.5 * final_risk)  [recomputed from clamped risk]
 - Capital Compounding: Starts at ₹20,000 | Lot Size: 65
+
+Charts: live tick candles are NOT persisted. When a trade executes, the traded
+contract + spot day candles are backfilled from the History API into the
+dashboard DB so the trade-detail modal is always faithful and gap-free.
 
 Bug fixes applied (audit A1-A9):
   A1: Missed-signal race — check divergence on ANY candle completion
@@ -66,7 +84,12 @@ OPTION_PRICE_MIN = 70.0
 OPTION_PRICE_MAX = 80.0
 OPTION_PRICE_TARGET = 75.0
 STRIKE_STEP = 50
-OPTION_REFRESH_SECONDS = 600
+# Fixed-universe model: subscribe this many OTM strikes per side (CE above ATM,
+# PE below ATM) once at startup and hold them all day. No mid-day rotation.
+STRIKES_PER_SIDE = 30
+# Safety net: confirm a signal candle's OHLC against the Fyers History API before
+# arming the pending signal (and use the History high/low for the entry trigger).
+HISTORY_CONFIRM_SIGNALS = True
 API_DELAY = 0.6
 TRADE_LOG_FILE = "live_5min_trades.csv"
 MARKET_DATA_OPEN = dt_time(9, 15)  # Start collecting candles here (NSE open) — feeds avg candle size
@@ -206,6 +229,9 @@ class ActiveTrade5Min:
             'signal_time': self.signal_candle['time'],
             'signal_high': self.signal_candle['high'],
             'signal_low': self.signal_candle['low'],
+            # Full signal-candle OHLC for audit (the History-confirmed candle)
+            'signal_open': self.signal_candle.get('open'),
+            'signal_close': self.signal_candle.get('close'),
         }
 
 class Live5MinEngine:
@@ -216,15 +242,17 @@ class Live5MinEngine:
         self.client_id = None
         self.is_running = False  # WS connected flag only (A4)
 
-        self.ce_symbol = None
-        self.pe_symbol = None
-        self.ce_ltp = None
-        self.pe_ltp = None
+        # Fixed-universe model: lists of subscribed CE/PE option symbols (held all
+        # day) + per-symbol last traded price. No single "current" CE/PE anymore.
+        self.ce_symbols = []
+        self.pe_symbols = []
+        self.option_symbols = set()
+        self.ltps = {}          # symbol -> last traded price (spot + all options)
+        self.expiry = None      # nearest-expiry epoch string used for the universe
         self.spot_ltp = None
-        
+
         self._symbol_lock = threading.Lock()
-        self._refresh_thread = None
-        # A4: Stop event for clean shutdown — main loop + refresh worker check this
+        # A4: Stop event for clean shutdown — main loop checks this
         self._stop_event = threading.Event()
         # A5: One-shot EOD flag
         self._eod_done = False
@@ -351,10 +379,12 @@ class Live5MinEngine:
                 'daily_pnl': self.daily_pnl,
                 'daily_signals': self.daily_signals,
                 'spot_ltp': self.spot_ltp,
-                'ce_ltp': self.ce_ltp,
-                'pe_ltp': self.pe_ltp,
-                'ce_symbol': self.ce_symbol,
-                'pe_symbol': self.pe_symbol,
+                # Fixed-universe model: there is no single CE/PE. Report the
+                # universe size + expiry so the dashboard header can show context.
+                'universe_count': len(self.option_symbols),
+                'ce_count': len(self.ce_symbols),
+                'pe_count': len(self.pe_symbols),
+                'expiry': self.expiry,
                 'active_trade': active_trade_data,
                 'pending_signals': pending_list,
             }
@@ -391,36 +421,67 @@ class Live5MinEngine:
         logger.info("✅ Authentication successful!")
         return True
 
-    def find_options_in_range(self):
+    def build_option_universe(self):
+        """Build the FIXED daily option universe (no rotation).
+
+        Picks the nearest weekly expiry, then selects STRIKES_PER_SIDE OTM CE
+        strikes (ATM and above) and STRIKES_PER_SIDE OTM PE strikes (ATM and
+        below). These are subscribed once at startup and held all day.
+
+        Returns (ce_symbols, pe_symbols) as lists, or (None, None) on failure.
+        """
         try:
             time.sleep(API_DELAY)
             data = {"symbol": SPOT_SYMBOL, "strikecount": 5, "timestamp": ""}
             resp = self.fyers.optionchain(data=data)
-            if resp.get('code') != 200: return None, None
+            if not isinstance(resp, dict) or resp.get('code') != 200:
+                return None, None
             nearest_expiry = str(resp['data']['expiryData'][0]['expiry'])
 
             time.sleep(API_DELAY)
-            data = {"symbol": SPOT_SYMBOL, "strikecount": 30, "timestamp": nearest_expiry}
+            # strikecount max is 50; 30 returns 30 ITM + 30 OTM per side.
+            data = {"symbol": SPOT_SYMBOL, "strikecount": 50, "timestamp": nearest_expiry}
             resp = self.fyers.optionchain(data=data)
-            if resp.get('code') != 200: return None, None
+            if not isinstance(resp, dict) or resp.get('code') != 200:
+                return None, None
             options = resp['data']['optionsChain']
 
-            ce_cand = [o for o in options if o.get('option_type') == 'CE' and OPTION_PRICE_MIN <= o.get('ltp', 0) <= OPTION_PRICE_MAX]
-            pe_cand = [o for o in options if o.get('option_type') == 'PE' and OPTION_PRICE_MIN <= o.get('ltp', 0) <= OPTION_PRICE_MAX]
-            
-            if not ce_cand or not pe_cand: # fallback
-                ce_cand = [o for o in options if o.get('option_type') == 'CE' and 50 <= o.get('ltp', 0) <= 80]
-                pe_cand = [o for o in options if o.get('option_type') == 'PE' and 50 <= o.get('ltp', 0) <= 80]
+            # Underlying spot: the chain includes an entry with strike_price == -1
+            # whose ltp is the index price. Fall back to live spot_ltp if needed.
+            spot = None
+            for o in options:
+                if o.get('strike_price') in (-1, None) and o.get('option_type') in ('', None):
+                    spot = o.get('ltp')
+                    break
+            if not spot:
+                spot = self.spot_ltp
+            if not spot:
+                logger.warning("build_option_universe: could not determine spot/ATM")
+                return None, None
 
-            ce_pick = min(ce_cand, key=lambda o: abs(o['ltp'] - OPTION_PRICE_TARGET)) if ce_cand else None
-            pe_pick = min(pe_cand, key=lambda o: abs(o['ltp'] - OPTION_PRICE_TARGET)) if pe_cand else None
+            atm = round(spot / STRIKE_STEP) * STRIKE_STEP
 
-            if ce_pick and pe_pick:
-                logger.info(f"  CE: {ce_pick['symbol']} | PE: {pe_pick['symbol']}")
-                return ce_pick['symbol'], pe_pick['symbol']
-            return None, None
+            ce_opts = [o for o in options
+                       if o.get('option_type') == 'CE' and o.get('strike_price', 0) >= atm]
+            pe_opts = [o for o in options
+                       if o.get('option_type') == 'PE' and o.get('strike_price', 0) <= atm and o.get('strike_price', 0) > 0]
+
+            # CE: ATM and OTM-above (ascending). PE: ATM and OTM-below (descending).
+            ce_opts.sort(key=lambda o: o['strike_price'])
+            pe_opts.sort(key=lambda o: o['strike_price'], reverse=True)
+
+            ce_syms = [o['symbol'] for o in ce_opts[:STRIKES_PER_SIDE]]
+            pe_syms = [o['symbol'] for o in pe_opts[:STRIKES_PER_SIDE]]
+
+            if not ce_syms or not pe_syms:
+                logger.warning("build_option_universe: empty CE/PE list after filtering")
+                return None, None
+
+            self.expiry = nearest_expiry
+            logger.info(f"  ATM≈{atm} | CE strikes={len(ce_syms)} PE strikes={len(pe_syms)} | expiry={nearest_expiry}")
+            return ce_syms, pe_syms
         except Exception as e:
-            logger.error(f"Error finding options: {e}")
+            logger.error(f"Error building option universe: {e}")
             return None, None
 
     # ---------- History API: accurate avg candle size (rotation-proof) ----------
@@ -481,173 +542,159 @@ class Live5MinEngine:
             logger.error(f"compute_avg_candle_size error for {symbol}: {e}")
             return None, []
 
-    def _prefetch_signal_avg(self, symbol, signal_candle_time):
-        """Background worker: compute the History-based avg for a pending signal
-        and store it on the signal. If the signal has already become the live
-        trade and is awaiting the avg, update its SL/TP. Never blocks the WS."""
+    def _confirm_and_arm(self, symbol, side, signal_candle_time, reason, tick_candle):
+        """Confirm a candidate signal against the History API, then arm it.
+
+        Runs synchronously on the WS thread (only when an in-range divergence
+        candidate exists — a few times a day at most). Does ONE History call that
+        both (a) confirms the signal candle's true color and (b) computes the
+        avg candle size for SL/TP. The authoritative History high/low becomes the
+        entry trigger, so phantom signals from sparse option ticks can't fire.
+        """
         avg, candles = self._compute_avg_candle_size(symbol, signal_candle_time)
 
-        # Backfill the option's candles into the DB (fills dashboard chart gaps)
-        if candles and self.db:
-            for c in candles:
-                self._db_write_candle(symbol, c, is_final=True)
+        sig_ts = signal_candle_time.timestamp()
+        hist_sig = next((c for c in candles if abs(c['time'].timestamp() - sig_ts) < 1), None)
 
-        if avg is None:
+        candle = tick_candle  # fallback
+        if HISTORY_CONFIRM_SIGNALS:
+            if hist_sig is not None:
+                option_green = hist_sig['close'] > hist_sig['open']
+                if not option_green:
+                    logger.info(f"  🚫 Signal REJECTED by History (option not green): {symbol} @ {signal_candle_time.strftime('%H:%M')} "
+                                f"O={hist_sig['open']:.2f} C={hist_sig['close']:.2f}")
+                    self._db_log_event('SIGNAL_REJECTED', f"{side} rejected (History candle not green): {symbol}", {
+                        'symbol': symbol, 'type': side,
+                        'hist_open': hist_sig['open'], 'hist_close': hist_sig['close'],
+                    })
+                    return
+                candle = hist_sig
+            else:
+                logger.warning(f"  ⚠️ History unavailable to confirm {symbol} @ {signal_candle_time.strftime('%H:%M')} "
+                               f"— arming on websocket candle (degraded)")
+        elif hist_sig is not None:
+            candle = hist_sig
+
+        # Don't arm if a trade opened while we were confirming.
+        if self.active_trade is not None:
             return
 
-        # Store on the pending signal (used at entry if still pending)
-        sig = self.pending_signals.get(symbol)
-        if sig is not None:
-            sig['avg_candle_size'] = avg
+        self.daily_signals += 1
+        self.pending_signals[symbol] = {
+            'type': side, 'high': candle['high'], 'low': candle['low'],
+            'candle': candle, 'reason': reason,
+            # Entry valid only during the immediately-next 5-min candle
+            # ([T+300, T+600)). signal_candle_time is the bucket START (T).
+            'expires_at': sig_ts + 600,
+            'avg_candle_size': avg,
+        }
+        avg_disp = f"{avg:.2f}" if avg is not None else "pending"
+        print()
+        logger.info(f"🎯 {side} ARMED: {symbol} | High: {candle['high']:.2f} | avg={avg_disp}")
+        self._db_log_event('SIGNAL', f"{side} signal: {symbol} high={candle['high']:.2f}", {
+            'symbol': symbol, 'type': side, 'high': candle['high'], 'low': candle['low'],
+        })
 
-        # If this signal already became the active trade waiting for the avg, update it
-        at = self.active_trade
-        if at is not None and at.symbol == symbol and at.is_open and at.avg_pending:
-            changed = at.apply_avg_candle_size(avg)
-            if changed:
-                logger.info(f"  🔧 SL/TP updated from History avg={avg:.2f} → SL {at.sl:.2f} TP {at.tp:.2f}")
-                self._db_log_event('INFO', f"SL/TP updated (avg={avg:.2f}): SL={at.sl:.2f} TP={at.tp:.2f}", {
-                    'symbol': symbol, 'sl': at.sl, 'tp': at.tp,
-                })
-                self._db_write_state(force=True)
-
-    def _option_refresh_worker(self):
-        # A4: Loop on _stop_event instead of is_running
-        while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=OPTION_REFRESH_SECONDS)
-            if self._stop_event.is_set():
-                break
-            if self.active_trade is not None or len(self.pending_signals) > 0:
-                continue
-
-            try:
-                new_ce, new_pe = self.find_options_in_range()
-                if not new_ce or not new_pe: continue
-                with self._symbol_lock:
-                    unsub, sub = [], []
-                    if new_ce != self.ce_symbol:
-                        if self.ce_symbol: unsub.append(self.ce_symbol)
-                        sub.append(new_ce)
-                        self.ce_symbol = new_ce
-                        self.ce_ltp = None
-                    if new_pe != self.pe_symbol:
-                        if self.pe_symbol: unsub.append(self.pe_symbol)
-                        sub.append(new_pe)
-                        self.pe_symbol = new_pe
-                        self.pe_ltp = None
-
-                    self.candle_history = {k: v for k, v in self.candle_history.items() if k == SPOT_SYMBOL}
-                    
-                if self.fyers_ws:
-                    if unsub:
-                        self.fyers_ws.unsubscribe(symbols=unsub)
-                        time.sleep(0.3)
-                    if sub:
-                        self.fyers_ws.subscribe(symbols=sub, data_type="SymbolUpdate")
-                        logger.info(f"📡 Subscribed: {sub}")
-            except Exception as e:
-                logger.error(f"Refresh error: {e}")
+    def _backfill_trade_charts(self, symbol, entry_time, exit_time):
+        """After a trade EXECUTES, backfill the traded option + spot day candles
+        from the History API into the dashboard DB so the trade-detail modal is
+        faithful and gap-free. Runs in a background thread; never blocks the WS.
+        """
+        if not self.db:
+            return
+        try:
+            day_open = entry_time.replace(hour=MARKET_DATA_OPEN.hour,
+                                          minute=MARKET_DATA_OPEN.minute,
+                                          second=0, microsecond=0)
+            range_from = day_open.timestamp()
+            # 15 min past exit to give the chart some right-side context.
+            range_to = exit_time.timestamp() + 900
+            for sym in (symbol, SPOT_SYMBOL):
+                candles = self._fetch_history_candles(sym, range_from, range_to)
+                for c in candles:
+                    self._db_write_candle(sym, c, is_final=True)
+            logger.info(f"  📊 Backfilled chart candles for {symbol} + spot")
+        except Exception as e:
+            logger.error(f"Chart backfill error for {symbol}: {e}")
 
     def _store_candle(self, symbol, candle):
-        # A4-race fix: guard candle_history (refresh worker may replace the dict
-        # under _symbol_lock concurrently). Same-thread as _on_message, but the
-        # lock here is released before check_divergence runs (no nesting).
+        # Guard candle_history with the lock (kept for thread-safety even though
+        # rotation is gone; backfill threads never touch candle_history).
         with self._symbol_lock:
             if symbol not in self.candle_history:
                 self.candle_history[symbol] = []
             self.candle_history[symbol].append(candle)
             # NOT POPPING - keep all candles for accurate avg candle size computation!
+        # NOTE: live tick candles are intentionally NOT persisted to the dashboard
+        # DB anymore. Charts are backfilled from History only when a trade executes.
 
-        # DB: write final candle
-        self._db_write_candle(symbol, candle, is_final=True)
-
-    # ---------- A1: Check divergence on ANY candle completion ----------
+    # ---------- Divergence across the full fixed universe ----------
     def check_divergence(self, completed_symbol, timestamp):
-        """Check for divergence signals.
-        
-        A1 fix: Called whenever ANY symbol's candle completes (not just SPOT).
-        Evaluates each pair only when both latest candles share the same bucket.
-        Deduplicates via self.last_signal_bucket.
+        """Evaluate divergence across EVERY subscribed strike on candle completion.
+
+        - Spot GREEN → look for any PE strike whose latest candle is GREEN (PE_BUY).
+        - Spot RED   → look for any CE strike whose latest candle is GREEN (CE_BUY).
+        Only strikes whose signal-candle close is in [OPTION_PRICE_MIN,
+        OPTION_PRICE_MAX] qualify; ties broken by closeness to OPTION_PRICE_TARGET.
+        At most ONE signal is armed per spot bucket (single-position strategy),
+        and it is History-confirmed before arming.
         """
-        # Single-trade rule: while a trade is open, ignore new setups entirely
-        # (matches the backtest's overlap guard — preference to the first trade).
+        # Single-trade rule: while a trade is open, ignore new setups entirely.
         if self.active_trade is not None:
             return
 
-        # Snapshot candle_history references under the lock (refresh worker may
-        # replace the dict concurrently).
+        # Snapshot candle_history under the lock.
         with self._symbol_lock:
             spot_candles = list(self.candle_history.get(SPOT_SYMBOL, []))
-            pe_candles = list(self.candle_history.get(self.pe_symbol, [])) if self.pe_symbol else []
-            ce_candles = list(self.candle_history.get(self.ce_symbol, [])) if self.ce_symbol else []
+            opt_latest = {}
+            for sym in self.ce_symbols + self.pe_symbols:
+                lst = self.candle_history.get(sym)
+                if lst:
+                    opt_latest[sym] = lst[-1]
 
         if not spot_candles:
             return
         spot_candle = spot_candles[-1]
+        bucket = spot_candle['time']
 
-        # Check PE divergence (Spot GREEN + PE GREEN)
-        if self.pe_symbol:
-            if pe_candles and pe_candles[-1]['time'] == spot_candle['time']:
-                pe_c = pe_candles[-1]
-                # A1: Dedupe — skip if signal already raised for this (pe_symbol, bucket)
-                bucket_key = (self.pe_symbol, spot_candle['time'])
-                if bucket_key not in self.last_signal_bucket:
-                    if spot_candle['close'] > spot_candle['open'] and pe_c['close'] > pe_c['open']:
-                        self.daily_signals += 1
-                        self.last_signal_bucket[bucket_key] = True
-                        rsn = f"Spot GREEN + PE GREEN"
-                        # A2: Entry is only valid during the candle IMMEDIATELY
-                        # after the signal candle. The signal candle's bucket
-                        # starts at T and ends at T+300; the next (entry) candle
-                        # spans [T+300, T+600). pe_c['time'] is the bucket START
-                        # (T), so expires_at = T+600 = end of that next candle.
-                        # => one 5-min bucket to break the high, else it expires.
-                        self.pending_signals[self.pe_symbol] = {
-                            'type': 'PE_BUY', 'high': pe_c['high'], 'low': pe_c['low'],
-                            'candle': pe_c, 'reason': rsn,
-                            'expires_at': pe_c['time'].timestamp() + 600,
-                            'avg_candle_size': None,  # filled by background History fetch
-                        }
-                        print()
-                        logger.info(f"🎯 PE Signal Detected: {self.pe_symbol} | High: {pe_c['high']:.2f}")
-                        self._db_log_event('SIGNAL', f"PE_BUY signal: {self.pe_symbol} high={pe_c['high']:.2f}", {
-                            'symbol': self.pe_symbol, 'type': 'PE_BUY', 'high': pe_c['high'], 'low': pe_c['low']
-                        })
-                        # Pre-fetch the accurate avg candle size (History API) in
-                        # the background so SL is correct at entry despite rotation.
-                        threading.Thread(
-                            target=self._prefetch_signal_avg,
-                            args=(self.pe_symbol, pe_c['time']), daemon=True
-                        ).start()
+        # One signal per bucket (dedupe by bucket time across all strikes).
+        if bucket in self.last_signal_bucket:
+            return
 
-        # Check CE divergence (Spot RED + CE GREEN)
-        if self.ce_symbol:
-            if ce_candles and ce_candles[-1]['time'] == spot_candle['time']:
-                ce_c = ce_candles[-1]
-                # A1: Dedupe
-                bucket_key = (self.ce_symbol, spot_candle['time'])
-                if bucket_key not in self.last_signal_bucket:
-                    if spot_candle['close'] < spot_candle['open'] and ce_c['close'] > ce_c['open']:
-                        self.daily_signals += 1
-                        self.last_signal_bucket[bucket_key] = True
-                        rsn = f"Spot RED + CE GREEN"
-                        # A2: same as PE above — entry valid only during the
-                        # immediately-next 5-min candle ([T+300, T+600)).
-                        self.pending_signals[self.ce_symbol] = {
-                            'type': 'CE_BUY', 'high': ce_c['high'], 'low': ce_c['low'],
-                            'candle': ce_c, 'reason': rsn,
-                            'expires_at': ce_c['time'].timestamp() + 600,
-                            'avg_candle_size': None,  # filled by background History fetch
-                        }
-                        print()
-                        logger.info(f"🎯 CE Signal Detected: {self.ce_symbol} | High: {ce_c['high']:.2f}")
-                        self._db_log_event('SIGNAL', f"CE_BUY signal: {self.ce_symbol} high={ce_c['high']:.2f}", {
-                            'symbol': self.ce_symbol, 'type': 'CE_BUY', 'high': ce_c['high'], 'low': ce_c['low']
-                        })
-                        threading.Thread(
-                            target=self._prefetch_signal_avg,
-                            args=(self.ce_symbol, ce_c['time']), daemon=True
-                        ).start()
+        spot_green = spot_candle['close'] > spot_candle['open']
+        spot_red = spot_candle['close'] < spot_candle['open']
+        if not (spot_green or spot_red):
+            return  # doji spot → no divergence either side
+
+        if spot_green:
+            side, reason, syms = 'PE_BUY', 'Spot GREEN + PE GREEN', self.pe_symbols
+        else:
+            side, reason, syms = 'CE_BUY', 'Spot RED + CE GREEN', self.ce_symbols
+
+        # Collect in-range green-option candidates for this bucket.
+        candidates = []  # (distance_to_target, symbol, option_candle)
+        for sym in syms:
+            oc = opt_latest.get(sym)
+            if not oc or oc['time'] != bucket:
+                continue
+            if not (oc['close'] > oc['open']):
+                continue  # option must be green
+            if not (OPTION_PRICE_MIN <= oc['close'] <= OPTION_PRICE_MAX):
+                continue  # price-range filter
+            candidates.append((abs(oc['close'] - OPTION_PRICE_TARGET), sym, oc))
+
+        if not candidates:
+            return
+
+        # Pick the candidate closest to the target price (~₹75).
+        candidates.sort(key=lambda x: x[0])
+        _, sym, oc = candidates[0]
+
+        # Mark the bucket as handled so we do at most one confirm call per bucket
+        # (even if the best candidate is rejected by History).
+        self.last_signal_bucket[bucket] = True
+        self._confirm_and_arm(sym, side, bucket, reason, oc)
+
 
     def _on_message(self, message):
         try:
@@ -657,13 +704,11 @@ class Live5MinEngine:
             # A8: Use explicit now for deterministic behavior
             symbol, ltp, now = message['symbol'], message['ltp'], datetime.now(IST)
 
-            with self._symbol_lock:
-                cur_ce, cur_pe = self.ce_symbol, self.pe_symbol
-
-            if symbol == SPOT_SYMBOL: self.spot_ltp = ltp
-            elif symbol == cur_ce: self.ce_ltp = ltp
-            elif symbol == cur_pe: self.pe_ltp = ltp
-            else: return
+            if symbol == SPOT_SYMBOL:
+                self.spot_ltp = ltp
+            elif symbol not in self.option_symbols:
+                return
+            self.ltps[symbol] = ltp
 
             # A5: One-shot EOD check
             if now.time() > MARKET_CLOSE:
@@ -701,16 +746,12 @@ class Live5MinEngine:
             comp = self.candle_manager.update(symbol, ltp, now)
             if comp:
                 self._store_candle(symbol, comp)
-                
-                # A1: Check divergence whenever ANY symbol's candle completes
-                # (old code only checked when SPOT candle completed)
+                # Check divergence whenever ANY symbol's candle completes.
                 self.check_divergence(symbol, now)
-            
-            # DB: write in-progress candle + state (throttled)
+
+            # DB: write engine state (heartbeat) only — live tick candles are no
+            # longer persisted (charts are backfilled from History on trade exec).
             if self.db:
-                in_prog = self.candle_manager.get_in_progress(symbol)
-                if in_prog:
-                    self._db_write_candle(symbol, in_prog, is_final=False)
                 self._db_write_state()
 
             self._print_status(now)
@@ -728,10 +769,9 @@ class Live5MinEngine:
             logger.warning(f"  ⚠️ Insufficient capital: Need ₹{cost_per_lot:.2f}, have ₹{self.running_capital:.2f}")
             return
 
-        # Use the accurate History-based avg pre-fetched at signal time if ready.
-        # If not ready yet (rare — fetch started at signal, entry is the next
-        # candle), pass None → ActiveTrade enters with the SAFE SL = signal_low
-        # and the background thread updates SL/TP the moment the avg arrives.
+        # Use the accurate History-based avg computed at signal-confirm time.
+        # If History was unavailable then (rare), avg is None → ActiveTrade enters
+        # with the SAFE SL = signal_low and the avg simply isn't applied.
         avg_sz = sig.get('avg_candle_size')
         self.active_trade = ActiveTrade5Min(symbol, sig['type'], ltp, ts, sig['candle'], sig['reason'], avg_sz, lots)
 
@@ -739,13 +779,6 @@ class Live5MinEngine:
         for other in list(self.pending_signals.keys()):
             if other != symbol:
                 del self.pending_signals[other]
-
-        # If the avg wasn't ready, kick a fetch now so SL/TP get corrected ASAP.
-        if avg_sz is None:
-            threading.Thread(
-                target=self._prefetch_signal_avg,
-                args=(symbol, sig['candle']['time']), daemon=True
-            ).start()
 
         avg_disp = avg_sz if avg_sz is not None else 0.0
         print()
@@ -783,6 +816,13 @@ class Live5MinEngine:
                 self.db.insert_trade(res, self.running_capital)
             except Exception:
                 pass
+            # Executed trades only: backfill the traded option + spot day candles
+            # from History so the trade-detail modal is faithful and gap-free.
+            threading.Thread(
+                target=self._backfill_trade_charts,
+                args=(res['symbol'], res['entry_time'], res['exit_time']),
+                daemon=True
+            ).start()
         self._db_log_event('EXIT', f"Exited {res['type']} on {res['symbol']} ({res['exit_reason']}) PnL=₹{res['pnl_total']:+.2f}", {
             'symbol': res['symbol'], 'exit_reason': res['exit_reason'], 'pnl': res['pnl_total'],
         })
@@ -795,11 +835,11 @@ class Live5MinEngine:
         self._eod_done = True
         
         if self.active_trade:
-            ltp = self.ce_ltp if self.active_trade.symbol == self.ce_symbol else self.pe_ltp
+            ltp = self.ltps.get(self.active_trade.symbol)
             res = self.active_trade.close_eod(ltp or self.active_trade.entry_price, now)
             if res: self._handle_trade_exit(res)
-        
-        # A4: Set stop event to cleanly stop main loop + refresh worker
+
+        # A4: Set stop event to cleanly stop main loop
         self._stop_event.set()
         print("\n✅ Market Closed. Daily PnL: ₹", self.daily_pnl)
         
@@ -814,10 +854,10 @@ class Live5MinEngine:
         print(f"\r{stts:<100}", end='', flush=True)
 
     def _on_open(self):
-        subs = [SPOT_SYMBOL]
-        if self.ce_symbol: subs.append(self.ce_symbol)
-        if self.pe_symbol: subs.append(self.pe_symbol)
+        subs = [SPOT_SYMBOL] + list(self.option_symbols)
+        # Fyers allows up to 5000 symbols per connection; we use ~61.
         self.fyers_ws.subscribe(symbols=subs, data_type="SymbolUpdate")
+        logger.info(f"📡 Subscribed {len(subs)} symbols (spot + {len(self.option_symbols)} options)")
         self.is_running = True  # A4: WS connected flag
         self.fyers_ws.keep_running()
 
@@ -871,26 +911,27 @@ class Live5MinEngine:
         if self._stop_event.is_set():
             return
 
-        # ---- Find tradable options (retry instead of exiting) ----
-        ce = pe = None
+        # ---- Build the fixed option universe (retry instead of exiting) ----
+        ce_syms = pe_syms = None
         attempts = 0
         while not self._stop_event.is_set():
-            ce, pe = self.find_options_in_range()
-            if ce and pe:
+            ce_syms, pe_syms = self.build_option_universe()
+            if ce_syms and pe_syms:
                 break
             attempts += 1
-            logger.warning(f"⚠️ Could not find options (attempt {attempts}) — retrying in 20s...")
+            logger.warning(f"⚠️ Could not build option universe (attempt {attempts}) — retrying in 20s...")
             if attempts == 1:
-                self._db_log_event('INFO', 'Searching for tradable options...')
+                self._db_log_event('INFO', 'Building option universe...')
             # Re-auth periodically in case the token is the problem.
             if attempts % 5 == 0:
-                logger.info("🔑 Re-authenticating before next option search...")
+                logger.info("🔑 Re-authenticating before next universe build...")
                 self.authenticate()
             self._stop_event.wait(timeout=20)
         if self._stop_event.is_set():
             return
-        self.ce_symbol, self.pe_symbol = ce, pe
-        logger.info(f"📡 Trading {self.ce_symbol} / {self.pe_symbol}")
+        self.ce_symbols, self.pe_symbols = ce_syms, pe_syms
+        self.option_symbols = set(ce_syms) | set(pe_syms)
+        logger.info(f"📡 Universe: {len(self.ce_symbols)} CE + {len(self.pe_symbols)} PE strikes")
         self._db_write_state(force=True)
 
         self.fyers_ws = data_ws.FyersDataSocket(
@@ -900,9 +941,7 @@ class Live5MinEngine:
             on_error=self._on_error, on_message=self._on_message
         )
         self.fyers_ws.connect()
-        self._refresh_thread = threading.Thread(target=self._option_refresh_worker, daemon=True)
-        self._refresh_thread.start()
-        
+
         try:
             # A4: Main loop checks _stop_event, not is_running.
             # Also checks clock to trigger EOD if ticks stop after 15:30.
