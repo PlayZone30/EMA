@@ -82,7 +82,7 @@ CAPITAL = 20000
 LOT_SIZE = 65
 OPTION_PRICE_MIN = 70.0
 OPTION_PRICE_MAX = 80.0
-OPTION_PRICE_TARGET = 75.0
+OPTION_PRICE_TARGET = 70.0
 STRIKE_STEP = 50
 # Fixed-universe model: subscribe this many OTM strikes per side (CE above ATM,
 # PE below ATM) once at startup and hold them all day. No mid-day rotation.
@@ -635,10 +635,14 @@ class Live5MinEngine:
 
         - Spot GREEN → look for any PE strike whose latest candle is GREEN (PE_BUY).
         - Spot RED   → look for any CE strike whose latest candle is GREEN (CE_BUY).
-        Only strikes whose signal-candle close is in [OPTION_PRICE_MIN,
-        OPTION_PRICE_MAX] qualify; ties broken by closeness to OPTION_PRICE_TARGET.
+        Strike selection (price-based):
+          1. Prefer strikes priced in [OPTION_PRICE_MIN, OPTION_PRICE_MAX]
+             (closest to OPTION_PRICE_TARGET).
+          2. If none in range, fall back to strikes priced ABOVE the max,
+             choosing the one nearest the max (cheapest above the band).
         At most ONE signal is armed per spot bucket (single-position strategy),
-        and it is History-confirmed before arming.
+        and it is History-confirmed before arming. Signals only start at/after
+        MARKET_OPEN (09:30) — earlier candles are ignored as signal candles.
         """
         # Single-trade rule: while a trade is open, ignore new setups entirely.
         if self.active_trade is not None:
@@ -658,6 +662,12 @@ class Live5MinEngine:
         spot_candle = spot_candles[-1]
         bucket = spot_candle['time']
 
+        # Strategy starts at MARKET_OPEN (09:30): the signal candle itself must
+        # start at/after 09:30. Candles from 09:15–09:30 only feed avg size; they
+        # are never treated as signal candles.
+        if bucket.time() < MARKET_OPEN:
+            return
+
         # One signal per bucket (dedupe by bucket time across all strikes).
         if bucket in self.last_signal_bucket:
             return
@@ -672,24 +682,33 @@ class Live5MinEngine:
         else:
             side, reason, syms = 'CE_BUY', 'Spot RED + CE GREEN', self.ce_symbols
 
-        # Collect in-range green-option candidates for this bucket.
-        candidates = []  # (distance_to_target, symbol, option_candle)
+        # Collect green-option candidates for this bucket (price >= floor).
+        candidates = []  # (symbol, option_candle)
         for sym in syms:
             oc = opt_latest.get(sym)
             if not oc or oc['time'] != bucket:
                 continue
             if not (oc['close'] > oc['open']):
                 continue  # option must be green
-            if not (OPTION_PRICE_MIN <= oc['close'] <= OPTION_PRICE_MAX):
-                continue  # price-range filter
-            candidates.append((abs(oc['close'] - OPTION_PRICE_TARGET), sym, oc))
+            if oc['close'] < OPTION_PRICE_MIN:
+                continue  # below the floor (too cheap) → skip
+            candidates.append((sym, oc))
 
         if not candidates:
             return
 
-        # Pick the candidate closest to the target price (~₹75).
-        candidates.sort(key=lambda x: x[0])
-        _, sym, oc = candidates[0]
+        # Tier 1: strikes in [MIN, MAX] → closest to TARGET (~₹70).
+        in_range = [(abs(oc['close'] - OPTION_PRICE_TARGET), sym, oc)
+                    for sym, oc in candidates if oc['close'] <= OPTION_PRICE_MAX]
+        if in_range:
+            in_range.sort(key=lambda x: x[0])
+            _, sym, oc = in_range[0]
+        else:
+            # Tier 2: nothing in band → take the strike nearest ABOVE the max
+            # (e.g. band empty, available 95/120 → pick 95).
+            above = [(oc['close'] - OPTION_PRICE_MAX, sym, oc) for sym, oc in candidates]
+            above.sort(key=lambda x: x[0])
+            _, sym, oc = above[0]
 
         # Mark the bucket as handled so we do at most one confirm call per bucket
         # (even if the best candidate is rejected by History).
